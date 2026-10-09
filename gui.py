@@ -12,18 +12,18 @@ import tkinter as tk
 from pathlib import Path
 from collections import abc
 from textwrap import dedent
-from math import log10, ceil
 from dataclasses import dataclass
-from tkinter.font import Font, nametofont
+from tkinter.font import Font
 from functools import partial, cached_property
 from datetime import datetime, timedelta, timezone
-from tkinter import Tk, ttk, StringVar, DoubleVar, IntVar
+from tkinter import ttk, StringVar, DoubleVar, IntVar
 from typing import Any, Union, Tuple, TypedDict, NoReturn, Generic, TYPE_CHECKING
 
 import pystray
+import customtkinter as ctk
 from yarl import URL
 from PIL.ImageTk import PhotoImage
-from PIL import Image as Image_module
+from PIL import Image as Image_module, ImageDraw
 
 if sys.platform == "win32":
     import win32api
@@ -39,6 +39,7 @@ from exceptions import MinerException, ExitRequest
 from utils import resource_path, set_root_icon, webopen, task_wrapper, Game, _T
 from constants import (
     MAX_INT,
+    URLType,
     SELF_PATH,
     IS_PACKAGED,
     SCRIPTS_PATH,
@@ -59,11 +60,33 @@ if TYPE_CHECKING:
     from channel import Channel
     from settings import Settings
     from inventory import DropsCampaign, TimedDrop
+    from PIL.Image import Image
 
 
 logger = logging.getLogger("TwitchDrops")
 TK_PADDING = Union[int, Tuple[int, int], Tuple[int, int, int], Tuple[int, int, int, int]]
-DIGITS = ceil(log10(WS_TOPICS_LIMIT))
+
+# (light, dark) color pairs used by every CustomTkinter widget in the app.
+# CustomTkinter widgets re-paint themselves automatically on ctk.set_appearance_mode(...)
+# as long as they were constructed with a (light, dark) tuple, so this is the single
+# source of truth for the palette - no manual per-widget recoloring is needed on toggle.
+PALETTE: dict[str, tuple[str, str]] = {
+    "bg": ("#f7f8fa", "#1e1e1e"),
+    "surface": ("#ffffff", "#252525"),
+    "border": ("#e4e7ec", "#3c3c3c"),
+    "fg": ("#1a1d23", "#e6e6e6"),
+    "muted": ("#6b7280", "#b3b3b3"),
+    "link": ("#5b21b6", "#4ea3ff"),
+    "accent": ("#5b21b6", "#0d99ff"),
+    "accent_hover": ("#4c1d95", "#3fb0ff"),
+    "on_accent": ("#ffffff", "#ffffff"),
+    "ok": ("#12b76a", "#3ddc84"),
+    "warn": ("#dc6803", "#e8b339"),
+    "danger": ("#f04438", "#ff6b61"),
+    "sel": ("#ede6ff", "#094771"),
+    "accent_soft": ("#c4b5fd", "#2a3a66"),  # lighter secondary progress-bar fill
+    "ok_soft": ("#e7f8ee", "#103324"),  # "live" badge background
+}
 
 
 ######################
@@ -80,117 +103,85 @@ class _TKOutputHandler(logging.Handler):
         self._output.print(self.format(record))
 
 
-class PlaceholderEntry(ttk.Entry):
-    def __init__(
-        self,
-        master: ttk.Widget,
-        *args: Any,
-        placeholder: str,
-        prefill: str = '',
-        placeholdercolor: str = "grey60",
-        **kwargs: Any,
-    ):
+class PlaceholderEntry(ctk.CTkEntry):
+    """
+    CTkEntry already supports placeholder text/color natively (including the
+    .get() returning '' while the placeholder is showing), so this is now just
+    a thin wrapper adding the .clear()/.replace() convenience methods the rest
+    of the app expects.
+    """
+    def __init__(self, master: Any, *args: Any, placeholder: str, prefill: str = '', **kwargs: Any):
+        kwargs.setdefault("placeholder_text", placeholder)
+        kwargs.setdefault("placeholder_text_color", PALETTE["muted"])
+        kwargs.setdefault("fg_color", PALETTE["surface"])
+        kwargs.setdefault("text_color", PALETTE["fg"])
+        kwargs.setdefault("border_color", PALETTE["border"])
         super().__init__(master, *args, **kwargs)
-        self._prefill: str = prefill
-        self._show: str = kwargs.get("show", '')
-        self._text_color: str = kwargs.get("foreground", '')
-        self._ph_color: str = placeholdercolor
+        if prefill:
+            self.insert(0, prefill)
+
+    def clear(self) -> None:
+        self.delete(0, "end")
+
+    def replace(self, content: str) -> None:
+        self.delete(0, "end")
+        self.insert(0, content)
+
+
+class PlaceholderComboBox(ctk.CTkComboBox):
+    """
+    CTkComboBox has no native placeholder support (unlike CTkEntry), so this
+    implements the same show-grey-text-until-focused behavior by hand, directly
+    on the plain tkinter.Entry it keeps internally as `._entry`.
+    """
+    _PLACEHOLDER_COLOR = "grey60"
+
+    def __init__(self, master: Any, *args: Any, placeholder: str, **kwargs: Any):
+        kwargs.setdefault("fg_color", PALETTE["surface"])
+        kwargs.setdefault("text_color", PALETTE["fg"])
+        kwargs.setdefault("border_color", PALETTE["border"])
+        kwargs.setdefault("button_color", PALETTE["surface"])
+        # CTkComboBox defaults to a single literal "CTkComboBox" entry (both as the
+        # text it inserts into the field AND as the dropdown's one selectable option)
+        # whenever no 'values' kwarg is given - start it with an empty list instead,
+        # so the dropdown doesn't offer that literal string as a choice before the
+        # real values (set later via .configure(values=...)) ever arrive.
+        kwargs.setdefault("values", [])
+        super().__init__(master, *args, **kwargs)
         self._ph_text: str = placeholder
-        self.bind("<FocusIn>", self._focus_in)
-        self.bind("<FocusOut>", self._focus_out)
-        if isinstance(self, ttk.Combobox):
-            # only bind this for comboboxes
-            self.bind("<<ComboboxSelected>>", self._combobox_select)
         self._ph: bool = False
+        self._entry.delete(0, "end")
+        self._entry.bind("<FocusIn>", self._focus_in)
+        self._entry.bind("<FocusOut>", self._focus_out)
         self._insert_placeholder()
 
     def _insert_placeholder(self) -> None:
-        """
-        If we're empty, insert a placeholder, set placeholder text color and make sure it's shown.
-        If we're not empty, leave the box as is.
-        """
-        if not super().get():
+        if not self._entry.get():
             self._ph = True
-            super().config(foreground=self._ph_color, show='')
-            super().insert("end", self._ph_text)
+            self._entry.configure(fg=self._PLACEHOLDER_COLOR)
+            self._entry.insert(0, self._ph_text)
 
     def _remove_placeholder(self) -> None:
-        """
-        If we've had a placeholder, clear the box and set normal text colour and show.
-        """
         if self._ph:
             self._ph = False
-            super().delete(0, "end")
-            super().config(foreground=self._text_color, show=self._show)
-            if self._prefill:
-                super().insert("end", self._prefill)
+            self._entry.delete(0, "end")
+            self._entry.configure(fg=self._apply_appearance_mode(self._text_color))
 
-    def _focus_in(self, event: tk.Event[PlaceholderEntry]) -> None:
+    def _focus_in(self, event: tk.Event[Any] | None = None) -> None:
         self._remove_placeholder()
 
-    def _focus_out(self, event: tk.Event[PlaceholderEntry]) -> None:
+    def _focus_out(self, event: tk.Event[Any] | None = None) -> None:
         self._insert_placeholder()
-
-    def _combobox_select(self, event: tk.Event[PlaceholderEntry]):
-        # combobox clears and inserts the selected value internally, bypassing the insert method.
-        # disable the placeholder flag and set the color here, so _focus_in doesn't clear the entry
-        self._ph = False
-        super().config(foreground=self._text_color, show=self._show)
-
-    def _store_option(
-        self, options: dict[str, object], name: str, attr: str, *, remove: bool = False
-    ) -> None:
-        if name in options:
-            if remove:
-                value = options.pop(name)
-            else:
-                value = options[name]
-            setattr(self, attr, value)
-
-    def configure(self, *args: Any, **kwargs: Any) -> Any:
-        options: dict[str, Any] = {}
-        if args and args[0] is not None:
-            options.update(args[0])
-        if kwargs:
-            options.update(kwargs)
-        self._store_option(options, "show", "_show")
-        self._store_option(options, "foreground", "_text_color")
-        self._store_option(options, "placeholder", "_ph_text", remove=True)
-        self._store_option(options, "prefill", "_prefill", remove=True)
-        self._store_option(options, "placeholdercolor", "_ph_color", remove=True)
-        return super().configure(**kwargs)
-
-    def config(self, *args: Any, **kwargs: Any) -> Any:
-        # because 'config = configure' makes mypy complain
-        self.configure(*args, **kwargs)
 
     def get(self) -> str:
         if self._ph:
             return ''
         return super().get()
 
-    def insert(self, index: str | int, content: str) -> None:
-        # when inserting into the entry externally, disable the placeholder flag
-        if not content:
-            # if an empty string was passed in
-            return
-        self._remove_placeholder()
-        super().insert(index, content)
-
-    def delete(self, first: str | int, last: str | int | None = None) -> None:
-        super().delete(first, last)
-        self._insert_placeholder()
-
     def clear(self) -> None:
-        self.delete(0, "end")
-
-    def replace(self, content: str) -> None:
-        super().delete(0, "end")
-        self.insert("end", content)
-
-
-class PlaceholderCombobox(PlaceholderEntry, ttk.Combobox):
-    pass
+        self._remove_placeholder()
+        self._entry.delete(0, "end")
+        self._insert_placeholder()
 
 
 class PaddedListbox(tk.Listbox):
@@ -273,10 +264,10 @@ class PaddedListbox(tk.Listbox):
 
     def configure_theme(self, *, bg: str, fg: str, sel_bg: str, sel_fg: str):
         # Apply basic colors for dark/light mode
-        super().config(bg=bg, fg=fg, selectbackground=sel_bg, selectforeground=sel_fg)
+        super().configure(bg=bg, fg=fg, selectbackground=sel_bg, selectforeground=sel_fg)
 
 
-class MouseOverLabel(ttk.Label):
+class MouseOverLabel(ctk.CTkLabel):
     def __init__(self, *args, alt_text: str = '', reverse: bool = False, **kwargs) -> None:
         self._org_text: str = ''
         self._alt_text: str = ''
@@ -287,10 +278,10 @@ class MouseOverLabel(ttk.Label):
         self.configure(text=kwargs.get("text", ''), alt_text=alt_text, reverse=reverse)
 
     def _set_org(self, event: tk.Event[MouseOverLabel]):
-        super().config(text=self._org_text)
+        super().configure(text=self._org_text)
 
     def _set_alt(self, event: tk.Event[MouseOverLabel]):
-        super().config(text=self._alt_text)
+        super().configure(text=self._alt_text)
 
     def configure(self, *args: Any, **kwargs: Any) -> Any:
         options: dict[str, Any] = {}
@@ -337,27 +328,27 @@ class MouseOverLabel(ttk.Label):
                     else:
                         self._bind_enter = self.bind("<Enter>", self._set_alt)
                         self._bind_leave = self.bind("<Leave>", self._set_org)
-        return super().configure(options)
+        return super().configure(**options)
 
     def config(self, *args: Any, **kwargs: Any) -> Any:
         # because 'config = configure' makes mypy complain
         self.configure(*args, **kwargs)
 
 
-class LinkLabel(ttk.Label):
-    def __init__(self, *args, link: str, **kwargs) -> None:
+class LinkLabel(ctk.CTkLabel):
+    _FONT: ctk.CTkFont | None = None
+
+    def __init__(self, *args, link: str, plain: bool = False, **kwargs) -> None:
         self._link: str = link
-        # style provides font and foreground color
-        if "style" not in kwargs:
-            kwargs["style"] = "Link.TLabel"
-        elif not kwargs["style"]:
-            super().__init__(*args, **kwargs)
-            return
-        if "cursor" not in kwargs:
-            kwargs["cursor"] = "hand2"
-        if "padding" not in kwargs:
-            # W, N, E, S
-            kwargs["padding"] = (0, 2, 0, 2)
+        if not plain:
+            if "text_color" not in kwargs:
+                kwargs["text_color"] = PALETTE["link"]
+            if "font" not in kwargs:
+                if LinkLabel._FONT is None:
+                    LinkLabel._FONT = ctk.CTkFont(underline=True)
+                kwargs["font"] = LinkLabel._FONT
+            if "cursor" not in kwargs:
+                kwargs["cursor"] = "hand2"
         super().__init__(*args, **kwargs)
         self.bind("<ButtonRelease-1>", lambda e: webopen(self._link))
 
@@ -382,14 +373,14 @@ class SelectMenu(tk.Menubutton, Generic[_T]):
         self._menu_options: dict[str, _T] = options
         self._command = command
         self.menu = tk.Menu(self, tearoff=tearoff)
-        self.config(menu=self.menu)
+        self.configure(menu=self.menu)
         for name in options.keys():
             self.menu.add_command(label=name, command=partial(self._select, name))
         if default is not None and default in self._menu_options:
-            self.config(text=default)
+            self.configure(text=default)
 
     def _select(self, option: str) -> None:
-        self.config(text=option)
+        self.configure(text=option)
         if self._command is not None:
             self._command(self._menu_options[option])
 
@@ -397,7 +388,13 @@ class SelectMenu(tk.Menubutton, Generic[_T]):
         return self._menu_options[self.cget("text")]
 
 
-class SelectCombobox(ttk.Combobox):
+class SelectCombobox(ctk.CTkOptionMenu):
+    """
+    A read-only, fixed-choice dropdown (Language / Priority mode selectors).
+    Named/shaped like the old ttk.Combobox-based version so call sites don't
+    need to change: 'command' is still invoked as command(event), with event
+    always None, since none of the existing callbacks use it.
+    """
     def __init__(
         self,
         master: tk.Misc,
@@ -406,27 +403,34 @@ class SelectCombobox(ttk.Combobox):
         width: int | None = None,
         textvariable: tk.StringVar,
         values: list[str] | tuple[str, ...],
-        command: abc.Callable[[tk.Event[SelectCombobox]], None] | None = None,
+        command: abc.Callable[[tk.Event[Any] | None], None] | None = None,
         **kwargs,
     ) -> None:
         if width is None:
-            font = Font(master, ttk.Style().lookup("TCombobox", "font"))
-            # font.measure returns width in pixels, using '0' as the average character,
-            # which is 6 pixels wide. We can convert it to width in characters by dividing.
-            width = max(font.measure(v) // 6 + 1 for v in values)
+            font = Font(master, size=13)
+            width = max((font.measure(v) for v in values), default=100) + 48
         width += width_offset
+        self._user_command = command
         super().__init__(
             master,
             *args,
             width=width,
-            values=values,
-            state="readonly",
-            exportselection=False,
-            textvariable=textvariable,
+            values=list(values),
+            variable=textvariable,
+            command=self._on_select,
+            fg_color=PALETTE["surface"],
+            text_color=PALETTE["fg"],
+            button_color=PALETTE["surface"],
+            button_hover_color=PALETTE["border"],
+            dropdown_fg_color=PALETTE["surface"],
+            dropdown_text_color=PALETTE["fg"],
+            dropdown_hover_color=PALETTE["sel"],
             **kwargs,
         )
-        if command is not None:
-            self.bind("<<ComboboxSelected>>", command)
+
+    def _on_select(self, value: str) -> None:
+        if self._user_command is not None:
+            self._user_command(None)
 
 
 ###########################################
@@ -434,18 +438,107 @@ class SelectCombobox(ttk.Combobox):
 ###########################################
 
 
+def make_card(
+    master: tk.Misc, title: str | None, *, corner_radius: int = 14, small: bool = False
+) -> tuple[ctk.CTkFrame, ctk.CTkFrame]:
+    """
+    Builds a titled "card": a rounded, bordered frame with a title pinned at
+    its top, mimicking the look of the old ttk.LabelFrame sections.
+    Returns (outer, inner) - grid the outer into the parent layout, then grid
+    content into the returned inner frame exactly like the old LabelFrame body.
+
+    title=None skips the title row entirely (content starts flush at the top,
+    e.g. the Account card). small=True renders it as a tiny muted uppercase
+    eyebrow (e.g. "CONNECTION"/"ACTIVITY") instead of the normal bold title
+    used by most cards (e.g. "Channels").
+    """
+    outer = ctk.CTkFrame(
+        master,
+        corner_radius=corner_radius,
+        fg_color=PALETTE["surface"],
+        border_width=1,
+        border_color=PALETTE["border"],
+    )
+    outer.grid_columnconfigure(0, weight=1)
+    content_row = 0
+    if title:
+        if small:
+            ctk.CTkLabel(
+                outer,
+                text=title.upper(),
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color=PALETTE["muted"],
+                anchor="w",
+            ).grid(column=0, row=0, sticky="w", padx=14, pady=(12, 2))
+        else:
+            ctk.CTkLabel(
+                outer,
+                text=title,
+                font=ctk.CTkFont(weight="bold"),
+                text_color=PALETTE["fg"],
+                anchor="w",
+            ).grid(column=0, row=0, sticky="w", padx=14, pady=(10, 2))
+        content_row = 1
+    inner = ctk.CTkFrame(outer, fg_color="transparent")
+    inner.grid(column=0, row=content_row, sticky="nsew", padx=10, pady=(0 if title else 10, 10))
+    outer.grid_rowconfigure(content_row, weight=1)
+    return outer, inner
+
+
+def make_separator(master: tk.Misc) -> ctk.CTkFrame:
+    return ctk.CTkFrame(master, height=1, fg_color=PALETTE["border"])
+
+
+_circle_icon_cache: dict[tuple[int, str], PhotoImage] = {}
+
+
+def circle_icon(size: int, color: str) -> PhotoImage:
+    """A plain solid-color circle, used as a decorative placeholder (e.g. in place
+    of a per-channel avatar, which Twitch's API/this app has no image for)."""
+    key = (size, color)
+    if key not in _circle_icon_cache:
+        img = Image_module.new("RGBA", (size, size), (0, 0, 0, 0))
+        ImageDraw.Draw(img).ellipse((0, 0, size - 1, size - 1), fill=color)
+        _circle_icon_cache[key] = PhotoImage(img)
+    return _circle_icon_cache[key]
+
+
 class StatusBar:
-    def __init__(self, manager: GUIManager, master: ttk.Widget):
-        frame = ttk.LabelFrame(master, text=_("gui", "status", "name"), padding=(4, 0, 4, 4))
-        frame.grid(column=0, row=0, columnspan=3, sticky="nsew", padx=2)
-        self._label = ttk.Label(frame)
-        self._label.grid(column=0, row=0, sticky="nsew")
+    """
+    Renders as a small pill badge mounted into CampaignProgress's badge_slot
+    (top-right of the "now mining" hero card), rather than its own boxed
+    section - there's no separate "Status" card in the redesigned layout.
+    """
+    # prefix of the translated "Watching: {channel}" status text, used to detect
+    # the one status that means "actively mining" and deserves the green "live"
+    # treatment, as opposed to idle/transitional states
+    _WATCHING_PREFIX = _("status", "watching").split("{")[0]
+
+    def __init__(self, manager: GUIManager, master: tk.Misc):
+        self._badge = badge = ctk.CTkFrame(master, corner_radius=999, fg_color=PALETTE["sel"])
+        badge.grid(column=0, row=0, sticky="e")
+        self._dot = ctk.CTkFrame(
+            badge, width=6, height=6, corner_radius=3, fg_color=PALETTE["accent"],
+        )
+        self._dot.grid(column=0, row=0, padx=(10, 6), pady=6)
+        self._label = ctk.CTkLabel(
+            badge,
+            text='',
+            text_color=PALETTE["accent"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+        )
+        self._label.grid(column=1, row=0, padx=(0, 10), pady=6)
 
     def update(self, text: str):
-        self._label.config(text=text)
+        self._label.configure(text=text.upper())
+        live = text.startswith(self._WATCHING_PREFIX)
+        color = PALETTE["ok"] if live else PALETTE["accent"]
+        self._badge.configure(fg_color=PALETTE["ok_soft"] if live else PALETTE["sel"])
+        self._dot.configure(fg_color=color)
+        self._label.configure(text_color=color)
 
     def clear(self):
-        self._label.config(text='')
+        self._label.configure(text='')
 
 
 class _WSEntry(TypedDict):
@@ -454,33 +547,39 @@ class _WSEntry(TypedDict):
 
 
 class WebsocketStatus:
-    def __init__(self, manager: GUIManager, master: ttk.Widget):
-        frame = ttk.LabelFrame(master, text=_("gui", "websocket", "name"), padding=(4, 0, 4, 4))
-        frame.grid(column=0, row=1, sticky="nsew", padx=2)
-        self._status_var = StringVar(frame)
-        self._topics_var = StringVar(frame)
-        ttk.Label(
-            frame,
-            text='\n'.join(
-                _("gui", "websocket", "websocket").format(id=i)
-                for i in range(1, MAX_WEBSOCKETS + 1)
-            ),
-            style="MS.TLabel",
-        ).grid(column=0, row=0)
-        ttk.Label(
-            frame,
-            textvariable=self._status_var,
-            width=16,
-            justify="left",
-            style="MS.TLabel",
-        ).grid(column=1, row=0)
-        ttk.Label(
-            frame,
-            textvariable=self._topics_var,
-            width=(DIGITS * 2 + 1),
-            justify="right",
-            style="MS.TLabel",
-        ).grid(column=2, row=0)
+    """
+    "Connection" card: an aggregate "N/MAX connected" readout plus one small
+    colored bar segment per websocket (green once connected), rather than the
+    old raw per-socket status/topic-count text dump. The per-socket detail is
+    still tracked internally (and summed into the topic count) - it's just not
+    spelled out status-by-status in the UI anymore.
+    """
+    def __init__(self, manager: GUIManager, master: tk.Misc):
+        frame, body = make_card(master, "CONNECTION", small=True)
+        frame.grid(column=0, row=1, sticky="nsew", pady=(0, 10))
+        body.columnconfigure(0, weight=1)
+        self._connected_text = StringVar(body)
+        self._topics_text = StringVar(body)
+        ctk.CTkLabel(
+            body,
+            textvariable=self._connected_text,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            text_color=PALETTE["fg"],
+            anchor="w",
+        ).grid(column=0, row=0, sticky="w")
+        ctk.CTkLabel(
+            body, textvariable=self._topics_text, text_color=PALETTE["muted"], anchor="w",
+        ).grid(column=0, row=1, sticky="w", pady=(0, 10))
+        bars_row = ctk.CTkFrame(body, fg_color="transparent")
+        bars_row.grid(column=0, row=2, sticky="ew")
+        self._bars: list[ctk.CTkFrame] = []
+        for i in range(MAX_WEBSOCKETS):
+            bars_row.columnconfigure(i, weight=1)
+            bar = ctk.CTkFrame(
+                bars_row, height=5, corner_radius=3, fg_color=PALETTE["border"]
+            )
+            bar.grid(column=i, row=0, sticky="ew", padx=(0 if i == 0 else 4, 0))
+            self._bars.append(bar)
         self._items: dict[int, _WSEntry | None] = {i: None for i in range(MAX_WEBSOCKETS)}
         self._update()
 
@@ -504,17 +603,20 @@ class WebsocketStatus:
             self._update()
 
     def _update(self):
-        status_lines: list[str] = []
-        topic_lines: list[str] = []
+        connected_label = _("gui", "websocket", "connected")
+        connected = 0
+        total_topics = 0
         for idx in range(MAX_WEBSOCKETS):
-            if (item := self._items.get(idx)) is None:
-                status_lines.append('')
-                topic_lines.append('')
-            else:
-                status_lines.append(item["status"])
-                topic_lines.append(f"{item['topics']:>{DIGITS}}/{WS_TOPICS_LIMIT}")
-        self._status_var.set('\n'.join(status_lines))
-        self._topics_var.set('\n'.join(topic_lines))
+            item = self._items.get(idx)
+            is_connected = item is not None and item["status"] == connected_label
+            self._bars[idx].configure(
+                fg_color=PALETTE["ok"] if is_connected else PALETTE["border"]
+            )
+            if is_connected:
+                connected += 1
+                total_topics += item["topics"]
+        self._connected_text.set(f"{connected}/{MAX_WEBSOCKETS} {connected_label.lower()}")
+        self._topics_text.set(f"{total_topics}/{MAX_WEBSOCKETS * WS_TOPICS_LIMIT} topics")
 
 
 @dataclass
@@ -525,30 +627,60 @@ class LoginData:
 
 
 class LoginForm:
-    def __init__(self, manager: GUIManager, master: ttk.Widget):
+    """
+    Renders as the "Account" card (avatar circle + status + user id). The main
+    button doubles as Login (device-code flow) while logged out, and as Logout
+    (token invalidation) while logged in - toggled in update().
+    """
+    def __init__(self, manager: GUIManager, master: tk.Misc):
         self._manager = manager
-        self._var = StringVar(master)
-        frame = ttk.LabelFrame(master, text=_("gui", "login", "name"), padding=(4, 0, 4, 4))
-        frame.grid(column=1, row=1, sticky="nsew", padx=2)
-        frame.columnconfigure(0, weight=2)
-        frame.columnconfigure(1, weight=1)
-        frame.rowconfigure(4, weight=1)
-        ttk.Label(frame, text=_("gui", "login", "labels")).grid(column=0, row=0)
-        ttk.Label(frame, textvariable=self._var, justify="center").grid(column=1, row=0)
-        self._login_entry = PlaceholderEntry(frame, placeholder=_("gui", "login", "username"))
-        # self._login_entry.grid(column=0, row=1, columnspan=2)
-        self._pass_entry = PlaceholderEntry(
-            frame, placeholder=_("gui", "login", "password"), show='•'
+        self._status_text = StringVar(master)
+        self._id_text = StringVar(master)
+        frame, body = make_card(master, None)
+        frame.grid(column=0, row=0, sticky="nsew", pady=(0, 10))
+        body.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            body, text='', width=36, height=36, corner_radius=18, fg_color=PALETTE["sel"],
+        ).grid(column=0, row=0, rowspan=2, padx=(0, 10))
+        status_row = ctk.CTkFrame(body, fg_color="transparent")
+        status_row.grid(column=1, row=0, sticky="w")
+        self._status_dot = ctk.CTkFrame(
+            status_row, width=8, height=8, corner_radius=4, fg_color=PALETTE["muted"],
         )
-        # self._pass_entry.grid(column=0, row=2, columnspan=2)
-        self._token_entry = PlaceholderEntry(frame, placeholder=_("gui", "login", "twofa_code"))
-        # self._token_entry.grid(column=0, row=3, columnspan=2)
+        self._status_dot.grid(column=0, row=0, padx=(0, 6))
+        ctk.CTkLabel(
+            status_row,
+            textvariable=self._status_text,
+            font=ctk.CTkFont(weight="bold"),
+            text_color=PALETTE["fg"],
+            anchor="w",
+        ).grid(column=1, row=0, sticky="w")
+        ctk.CTkLabel(
+            body, textvariable=self._id_text, text_color=PALETTE["muted"], anchor="w",
+        ).grid(column=1, row=1, sticky="w")
+
+        self._login_entry = PlaceholderEntry(body, placeholder=_("gui", "login", "username"))
+        # self._login_entry.grid(column=0, row=2, columnspan=2)
+        self._pass_entry = PlaceholderEntry(
+            body, placeholder=_("gui", "login", "password"), show='•'
+        )
+        # self._pass_entry.grid(column=0, row=3, columnspan=2)
+        self._token_entry = PlaceholderEntry(body, placeholder=_("gui", "login", "twofa_code"))
+        # self._token_entry.grid(column=0, row=4, columnspan=2)
 
         self._confirm = asyncio.Event()
-        self._button = ttk.Button(
-            frame, text=_("gui", "login", "button"), command=self._confirm.set, state="disabled"
+        self._button = ctk.CTkButton(
+            body,
+            text=_("gui", "login", "button"),
+            command=self._confirm.set,
+            state="disabled",
+            font=ctk.CTkFont(weight="bold"),
+            fg_color=PALETTE["accent"],
+            hover_color=PALETTE["accent_hover"],
+            text_color=PALETTE["on_accent"],
         )
-        self._button.grid(column=0, row=4, columnspan=2)
+        self._button.grid(column=0, row=5, columnspan=2, sticky="ew", pady=(10, 0))
         self.update(_("gui", "login", "logged_out"), None)
 
     def clear(self, login: bool = False, password: bool = False, token: bool = False):
@@ -563,10 +695,10 @@ class LoginForm:
     async def wait_for_login_press(self) -> None:
         self._confirm.clear()
         try:
-            self._button.config(state="normal")
+            self._button.configure(state="normal")
             await self._manager.coro_unless_closed(self._confirm.wait())
         finally:
-            self._button.config(state="disabled")
+            self._button.configure(state="disabled")
 
     async def ask_login(self) -> LoginData:
         self.update(_("gui", "login", "required"), None)
@@ -606,11 +738,31 @@ class LoginForm:
         webopen(page_url)
 
     def update(self, status: str, user_id: int | None):
-        if user_id is not None:
-            user_str = str(user_id)
+        user_str = str(user_id) if user_id is not None else "-"
+        self._status_text.set(status)
+        self._id_text.set(f"ID {user_str}")
+        logged_in = status == _("gui", "login", "logged_in")
+        if logged_in:
+            dot_color = PALETTE["ok"]
+        elif status == _("gui", "login", "logged_out"):
+            dot_color = PALETTE["muted"]
         else:
-            user_str = "-"
-        self._var.set(f"{status}\n{user_str}")
+            dot_color = PALETTE["warn"]
+        self._status_dot.configure(fg_color=dot_color)
+        if logged_in:
+            # repurpose the button as a logout action while we're logged in,
+            # instead of a separate "Invalidate" link
+            self._button.configure(
+                text=_("gui", "login", "logout_button"),
+                state="normal",
+                command=lambda: self._manager.help.invalidate_token(),
+            )
+        else:
+            self._button.configure(
+                text=_("gui", "login", "button"),
+                state="disabled",
+                command=self._confirm.set,
+            )
 
 
 class _BaseVars(TypedDict):
@@ -634,10 +786,7 @@ class _ProgressVars(TypedDict):
 
 
 class CampaignProgress:
-    BAR_LENGTH = 420
-    ALMOST_DONE_SECONDS = 10
-
-    def __init__(self, manager: GUIManager, master: ttk.Widget):
+    def __init__(self, manager: GUIManager, master: tk.Misc):
         self._manager = manager
         self._vars: _ProgressVars = {
             "campaign": {
@@ -654,55 +803,189 @@ class CampaignProgress:
                 "remaining": StringVar(master),  # as above
             },
         }
-        self._frame = frame = ttk.LabelFrame(
-            master, text=_("gui", "progress", "name"), padding=(4, 0, 4, 4)
+        # "Now mining" hero card: icon + game/campaign title (+ a badge slot that
+        # StatusBar fills in) up top, the drop and campaign progress bars below.
+        outer = ctk.CTkFrame(
+            master,
+            corner_radius=16,
+            fg_color=PALETTE["surface"],
+            border_width=1,
+            border_color=PALETTE["border"],
         )
-        frame.grid(column=0, row=2, columnspan=2, sticky="nsew", padx=2)
-        frame.columnconfigure(0, weight=2)
-        frame.columnconfigure(1, weight=1)
-        game_campaign = ttk.Frame(frame)
-        game_campaign.grid(column=0, row=0, columnspan=2, sticky="nsew")
-        game_campaign.columnconfigure(0, weight=1)
-        game_campaign.columnconfigure(1, weight=1)
-        ttk.Label(game_campaign, text=_("gui", "progress", "game")).grid(column=0, row=0)
-        ttk.Label(game_campaign, textvariable=self._vars["campaign"]["game"]).grid(column=0, row=1)
-        ttk.Label(game_campaign, text=_("gui", "progress", "campaign")).grid(column=1, row=0)
-        ttk.Label(game_campaign, textvariable=self._vars["campaign"]["name"]).grid(column=1, row=1)
-        ttk.Label(
-            frame, text=_("gui", "progress", "campaign_progress")
-        ).grid(column=0, row=2, rowspan=2)
-        ttk.Label(frame, textvariable=self._vars["campaign"]["percentage"]).grid(column=1, row=2)
-        ttk.Label(frame, textvariable=self._vars["campaign"]["remaining"]).grid(column=1, row=3)
-        ttk.Progressbar(
-            frame,
-            mode="determinate",
-            length=self.BAR_LENGTH,
-            maximum=1,
-            variable=self._vars["campaign"]["progress"],
-        ).grid(column=0, row=4, columnspan=2)
-        ttk.Separator(
-            frame, orient="horizontal"
-        ).grid(row=5, columnspan=2, sticky="ew", pady=(4, 0))
-        ttk.Label(frame, text=_("gui", "progress", "drop")).grid(column=0, row=6, columnspan=2)
-        ttk.Label(
-            frame, textvariable=self._vars["drop"]["rewards"]
-        ).grid(column=0, row=7, columnspan=2)
-        ttk.Label(
-            frame, text=_("gui", "progress", "drop_progress")
-        ).grid(column=0, row=8, rowspan=2)
-        ttk.Label(frame, textvariable=self._vars["drop"]["percentage"]).grid(column=1, row=8)
-        ttk.Label(frame, textvariable=self._vars["drop"]["remaining"]).grid(column=1, row=9)
-        ttk.Progressbar(
-            frame,
-            mode="determinate",
-            length=self.BAR_LENGTH,
-            maximum=1,
+        self._frame = outer
+        outer.grid(column=0, row=0, sticky="nsew", pady=(0, 10))
+        outer.columnconfigure(1, weight=1)
+
+        self._icon_label = ctk.CTkLabel(
+            outer,
+            text="⛏",
+            width=150,
+            height=144,
+            # 0, not rounded - CTkLabel insets its content by min(corner_radius, height/2)
+            # on each side to keep text clear of rounded corners, which would otherwise
+            # leave the fg_color background showing around a full-bleed box art image.
+            corner_radius=0,
+            fg_color=PALETTE["accent"],
+            text_color=PALETTE["on_accent"],
+            font=ctk.CTkFont(size=28, weight="bold"),
+        )
+        # sticky="nsew" - stretches to the full card height (header + body rows);
+        # _render_icon() re-crops/re-renders the box art to match on every resize,
+        # so the fixed-size image doesn't end up smaller than the stretched label.
+        self._icon_label.grid(column=0, row=0, rowspan=2, sticky="nsew", padx=18, pady=18)
+        self._icon_label.bind("<Configure>", self._on_icon_configure)
+
+        header = ctk.CTkFrame(outer, fg_color="transparent")
+        header.grid(column=1, row=0, sticky="nsew", pady=(18, 0), padx=(0, 18))
+        header.columnconfigure(0, weight=1)
+        title_box = ctk.CTkFrame(header, fg_color="transparent")
+        title_box.grid(column=0, row=0, sticky="w")
+        ctk.CTkLabel(
+            title_box,
+            text="NOW MINING",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=PALETTE["accent"],
+            anchor="w",
+        ).grid(sticky="w")
+        ctk.CTkLabel(
+            title_box,
+            textvariable=self._vars["campaign"]["game"],
+            font=ctk.CTkFont(size=19, weight="bold"),
+            text_color=PALETTE["fg"],
+            anchor="w",
+        ).grid(sticky="w")
+        ctk.CTkLabel(
+            title_box,
+            textvariable=self._vars["campaign"]["name"],
+            text_color=PALETTE["muted"],
+            anchor="w",
+        ).grid(sticky="w")
+        # StatusBar mounts its pill/badge into this slot - keeps the two classes
+        # independent while still sharing one visual card.
+        self.badge_slot = ctk.CTkFrame(header, fg_color="transparent")
+        self.badge_slot.grid(column=1, row=0, sticky="ne")
+
+        body = ctk.CTkFrame(outer, fg_color="transparent")
+        body.grid(column=1, row=1, sticky="nsew", padx=(0, 18), pady=(10, 18))
+        body.columnconfigure(0, weight=1)
+
+        drop_row = ctk.CTkFrame(body, fg_color="transparent")
+        drop_row.grid(column=0, row=0, sticky="ew")
+        drop_row.columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            drop_row,
+            textvariable=self._vars["drop"]["rewards"],
+            font=ctk.CTkFont(weight="bold"),
+            text_color=PALETTE["fg"],
+            anchor="w",
+        ).grid(column=0, row=0, sticky="w")
+        ctk.CTkLabel(
+            drop_row, textvariable=self._vars["drop"]["remaining"], text_color=PALETTE["muted"],
+        ).grid(column=1, row=0, sticky="e")
+        ctk.CTkProgressBar(
+            body,
+            height=8,
+            corner_radius=4,
+            fg_color=PALETTE["border"],
+            progress_color=PALETTE["accent"],
             variable=self._vars["drop"]["progress"],
-        ).grid(column=0, row=10, columnspan=2)
+        ).grid(column=0, row=1, sticky="ew", pady=(6, 14))
+
+        campaign_row = ctk.CTkFrame(body, fg_color="transparent")
+        campaign_row.grid(column=0, row=2, sticky="ew")
+        campaign_row.columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            campaign_row,
+            text=_("gui", "progress", "campaign_progress"),
+            text_color=PALETTE["muted"],
+            anchor="w",
+        ).grid(column=0, row=0, sticky="w")
+        ctk.CTkLabel(
+            campaign_row, textvariable=self._vars["campaign"]["percentage"],
+            text_color=PALETTE["muted"],
+        ).grid(column=1, row=0, sticky="e")
+        ctk.CTkProgressBar(
+            body,
+            height=6,
+            corner_radius=3,
+            fg_color=PALETTE["border"],
+            progress_color=PALETTE["accent_soft"],
+            variable=self._vars["campaign"]["progress"],
+        ).grid(column=0, row=3, sticky="ew", pady=(6, 2))
+
         self._drop: TimedDrop | None = None
         self._seconds: int = 0
         self._timer_task: asyncio.Task[None] | None = None
+        self._icon_url: URLType | None = None
+        self._icon_task: asyncio.Task[None] | None = None
+        self._icon_source: Image | None = None
+        self._icon_rendered_size: tuple[int, int] = (0, 0)
         self.display(None)
+
+    def _set_icon(self, image_url: URLType) -> None:
+        if image_url == self._icon_url:
+            return
+        self._icon_url = image_url
+        if self._icon_task is not None:
+            self._icon_task.cancel()
+
+        async def load() -> None:
+            self._icon_source = await self._manager._cache.get_image(image_url)
+            self._icon_rendered_size = (0, 0)  # force a re-render at the current label size
+            self._render_icon()
+            self._icon_task = None
+
+        self._icon_task = asyncio.create_task(load())
+
+    def _render_icon(self) -> None:
+        source = self._icon_source
+        if source is None:
+            return
+        width = self._icon_label.winfo_width()
+        height = self._icon_label.winfo_height()
+        if width < 10 or height < 10:
+            # not laid out yet (e.g. still starting up) - render at the label's own
+            # declared minimum size instead, _on_icon_configure will re-render later
+            width, height = 150, 144
+        if (width, height) == self._icon_rendered_size:
+            return
+        self._icon_rendered_size = (width, height)
+        # crop to the label's exact aspect ratio first - letting CTkImage's own resize
+        # stretch/squish a differently-shaped source would distort the box art
+        src_width, src_height = source.size
+        target_ratio = width / height
+        if src_width / src_height > target_ratio:
+            new_width = round(src_height * target_ratio)
+            left = (src_width - new_width) // 2
+            cropped = source.crop((left, 0, left + new_width, src_height))
+        else:
+            new_height = round(src_width / target_ratio)
+            top = (src_height - new_height) // 2
+            cropped = source.crop((0, top, src_width, top + new_height))
+        cropped = cropped.resize((width, height), Image_module.Resampling.LANCZOS)
+        # CTkLabel can't clip an image to its own rounded corners (corner_radius only
+        # rounds its plain background rect) - bake rounded corners into the image data
+        # itself instead, filled with the current theme's surface color so they blend
+        # into the card background behind it.
+        mode_idx = 1 if ctk.get_appearance_mode() == "Dark" else 0
+        bg_color = PALETTE["surface"][mode_idx]
+        mask = Image_module.new("L", (width, height), 0)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, width - 1, height - 1), radius=14, fill=255)
+        rounded = Image_module.new("RGB", (width, height), bg_color)
+        rounded.paste(cropped.convert("RGB"), mask=mask)
+        icon = ctk.CTkImage(light_image=rounded, size=(width, height))
+        self._icon_label.configure(image=icon, text="")
+
+    def _on_icon_configure(self, event: tk.Event) -> None:
+        self._render_icon()
+
+    def _clear_icon(self) -> None:
+        self._icon_url = None
+        self._icon_source = None
+        if self._icon_task is not None:
+            self._icon_task.cancel()
+            self._icon_task = None
+        self._icon_label.configure(image=None, text="⛏")
 
     def _divmod(self, minutes: int) -> tuple[int, int]:
         if self._seconds < 60 and minutes > 0:
@@ -755,10 +1038,6 @@ class CampaignProgress:
             self._timer_task.cancel()
             self._timer_task = None
 
-    def minute_almost_done(self) -> bool:
-        # already or almost done
-        return self._timer_task is None or self._seconds <= self.ALMOST_DONE_SECONDS
-
     def display(self, drop: TimedDrop | None, *, countdown: bool = True, subone: bool = False):
         self._drop = drop
         vars_drop = self._vars["drop"]
@@ -773,18 +1052,18 @@ class CampaignProgress:
             vars_campaign["game"].set("...")
             vars_campaign["progress"].set(0.0)
             vars_campaign["percentage"].set("-%")
+            self._clear_icon()
             self._update_time(0)
             return
-        vars_drop["rewards"].set(drop.rewards_text())
+        vars_drop["rewards"].set(f"{_('gui', 'progress', 'drop')} {drop.rewards_text()}")
         vars_drop["progress"].set(drop.progress)
         vars_drop["percentage"].set(f"{drop.progress:6.1%}")
         campaign = drop.campaign
         vars_campaign["name"].set(campaign.name)
         vars_campaign["game"].set(campaign.game.name)
+        self._set_icon(campaign.image_url)
         vars_campaign["progress"].set(campaign.progress)
-        vars_campaign["percentage"].set(
-            f"{campaign.progress:6.1%} ({campaign.claimed_drops}/{campaign.total_drops})"
-        )
+        vars_campaign["percentage"].set(f"{campaign.progress:.0%}")
         if countdown:
             # restart our seconds update timer
             self.start_timer()
@@ -799,283 +1078,300 @@ class CampaignProgress:
 
 
 class ConsoleOutput:
-    def __init__(self, manager: GUIManager, master: ttk.Widget):
-        frame = ttk.LabelFrame(master, text=_("gui", "output"), padding=(4, 0, 4, 4))
-        frame.grid(column=0, row=3, columnspan=3, sticky="nsew", padx=2)
-        # tell master frame that the containing row can expand
-        master.rowconfigure(3, weight=1)
-        frame.rowconfigure(0, weight=1)  # let the frame expand
-        frame.columnconfigure(0, weight=1)
-        xscroll = ttk.Scrollbar(frame, orient="horizontal")
-        yscroll = ttk.Scrollbar(frame, orient="vertical")
-        self._text = tk.Text(
-            frame,
-            width=52,
-            height=10,
-            wrap="none",
+    def __init__(self, manager: GUIManager, master: tk.Misc):
+        frame, body = make_card(master, "ACTIVITY", small=True)
+        frame.grid(column=0, row=2, sticky="nsew")
+        body.rowconfigure(0, weight=1)  # let the frame expand
+        body.columnconfigure(0, weight=1)
+        self._text = ctk.CTkTextbox(
+            body,
+            width=260,
+            height=160,
+            wrap="word",
             state="disabled",
-            exportselection=False,
-            xscrollcommand=xscroll.set,
-            yscrollcommand=yscroll.set,
+            corner_radius=8,
+            fg_color=PALETTE["bg"],
+            text_color=PALETTE["fg"],
+            font=ctk.CTkFont(family="Courier New", size=11),
         )
-        xscroll.config(command=self._text.xview)
-        yscroll.config(command=self._text.yview)
         self._text.grid(column=0, row=0, sticky="nsew")
-        xscroll.grid(column=0, row=1, sticky="ew")
-        yscroll.grid(column=1, row=0, sticky="ns")
 
     def print(self, message: str):
         stamp = datetime.now().strftime("%X")
         if '\n' in message:
             message = message.replace('\n', f"\n{stamp}: ")
-        self._text.config(state="normal")
+        self._text.configure(state="normal")
         self._text.insert("end", f"{stamp}: {message}\n")
         self._text.see("end")  # scroll to the newly added line
-        self._text.config(state="disabled")
-
-    def configure_theme(self, *, bg: str, fg: str, sel_bg: str, sel_fg: str):
-        # Apply colors to the Tk Text widget used for console output
-        self._text.config(
-            bg=bg,
-            fg=fg,
-            insertbackground=fg,
-            selectbackground=sel_bg,
-            selectforeground=sel_fg,
-        )
+        self._text.configure(state="disabled")
 
 
-class _Buttons(TypedDict):
-    frame: ttk.Frame
-    switch: ttk.Button
+class _ChannelRow(TypedDict):
+    frame: ctk.CTkFrame
+    name_label: ctk.CTkLabel
+    badge: ctk.CTkFrame
+    game_label: ctk.CTkLabel
+    viewers_label: ctk.CTkLabel
+    status_dot: ctk.CTkFrame
+    status_label: ctk.CTkLabel
 
 
 class ChannelList:
-    def __init__(self, manager: GUIManager, master: ttk.Widget):
+    """
+    A custom scrollable list of per-channel row widgets (avatar dot, name +
+    "WATCHING" badge, game, viewers, colored status dot+text) instead of a
+    ttk.Treeview table - this is what it takes to get pill badges and colored
+    rows matching the Clarity mockup exactly, which a plain Treeview cell
+    (plain text only) can't render. Column widths are fixed pixel minsizes
+    shared between the header row and every data row, so they line up.
+
+    NOTE: the original Treeview had two extra trailing columns (a drops-
+    enabled and an ACL-allowed indicator per channel) that the mockup doesn't
+    have. Dropped to match it exactly; that data still drives the app's
+    actual channel selection internally, it's just not shown here anymore.
+    """
+    # (minsize px, stretch weight) per column - shared by the header row and every
+    # data row, so they both grow in lockstep and the table fills the card's width
+    # instead of leaving a dead gap after the last column.
+    _COLUMNS = ((34, 0), (170, 3), (150, 2), (90, 1), (110, 1))
+
+    def __init__(self, manager: GUIManager, master: tk.Misc):
         self._manager = manager
-        frame = ttk.LabelFrame(master, text=_("gui", "channels", "name"), padding=(4, 0, 4, 4))
-        frame.grid(column=2, row=1, rowspan=2, sticky="nsew", padx=2)
-        # tell master frame that the containing column can expand
-        master.columnconfigure(2, weight=1)
-        frame.rowconfigure(1, weight=1)
-        frame.columnconfigure(0, weight=1)
-        buttons_frame = ttk.Frame(frame)
-        self._buttons: _Buttons = {
-            "frame": buttons_frame,
-            "switch": ttk.Button(
-                buttons_frame,
-                text=_("gui", "channels", "switch"),
-                state="disabled",
-                command=manager._twitch.state_change(State.CHANNEL_SWITCH),
-            ),
-        }
-        buttons_frame.grid(column=0, row=0, columnspan=2)
-        self._buttons["switch"].grid(column=0, row=0)
-        scroll = ttk.Scrollbar(frame, orient="vertical")
-        self._table = table = ttk.Treeview(
-            frame,
-            # columns definition is updated by _add_column
-            yscrollcommand=scroll.set,
+        outer = ctk.CTkFrame(
+            master,
+            corner_radius=14,
+            fg_color=PALETTE["surface"],
+            border_width=1,
+            border_color=PALETTE["border"],
         )
-        scroll.config(command=table.yview)
-        table.grid(column=0, row=1, sticky="nsew")
-        scroll.grid(column=1, row=1, sticky="ns")
-        self._font = Font(frame, manager._style.lookup("Treeview", "font"))
-        self._const_width: set[str] = set()
-        table.tag_configure("watching", background="gray70")
-        table.bind("<Button-1>", self._disable_column_resize)
-        table.bind("<<TreeviewSelect>>", self._selected)
-        self._add_column("#0", '', width=0)
-        self._add_column(
-            "channel", _("gui", "channels", "headings", "channel"), width=100, anchor='w'
+        self._frame = outer
+        outer.grid(column=0, row=1, sticky="nsew")
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(2, weight=1)
+
+        title_row = ctk.CTkFrame(outer, fg_color="transparent")
+        title_row.grid(column=0, row=0, sticky="ew", padx=14, pady=(12, 10))
+        title_row.columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            title_row,
+            text=_("gui", "channels", "name"),
+            font=ctk.CTkFont(weight="bold"),
+            text_color=PALETTE["fg"],
+            anchor="w",
+        ).grid(column=0, row=0, sticky="w")
+        self._switch_button = ctk.CTkButton(
+            title_row,
+            text=_("gui", "channels", "switch"),
+            state="disabled",
+            command=manager._twitch.state_change(State.CHANNEL_SWITCH),
+            fg_color=PALETTE["surface"],
+            hover_color=PALETTE["border"],
+            text_color=PALETTE["accent"],
+            border_width=1,
+            border_color=PALETTE["accent"],
         )
-        self._add_column(
-            "status",
+        self._switch_button.grid(column=1, row=0, sticky="e")
+
+        header_row = ctk.CTkFrame(outer, fg_color="transparent")
+        header_row.grid(column=0, row=1, sticky="ew", padx=(20, 14))
+        self._configure_columns(header_row)
+        header_font = ctk.CTkFont(size=11, weight="bold")
+        headings = (
+            _("gui", "channels", "headings", "channel"),
+            _("gui", "channels", "headings", "game"),
+            _("gui", "channels", "headings", "viewers"),
             _("gui", "channels", "headings", "status"),
-            width_template=[
-                _("gui", "channels", "online"),
-                _("gui", "channels", "pending"),
-                _("gui", "channels", "offline"),
-            ],
         )
-        self._add_column("game", _("gui", "channels", "headings", "game"), width=50)
-        self._add_column("drops", "🎁", width_template="✔")
-        self._add_column(
-            "viewers", _("gui", "channels", "headings", "viewers"), width_template="1234567"
-        )
-        self._add_column("acl_base", "📋", width_template="✔")
+        for i, text in enumerate(headings, start=1):
+            ctk.CTkLabel(
+                header_row, text=text.upper(), font=header_font, text_color=PALETTE["muted"],
+                anchor="w",
+            ).grid(column=i, row=0, sticky="w")
+
+        self._rows_area = ctk.CTkScrollableFrame(outer, fg_color="transparent")
+        self._rows_area.grid(column=0, row=2, sticky="nsew", padx=6, pady=(4, 10))
+        self._rows_area.columnconfigure(0, weight=1)
+
+        self._avatar_icon = circle_icon(18, "#9ca3af")
+        self._rows: dict[str, _ChannelRow] = {}
+        self._row_order: list[str] = []
         self._channel_map: dict[str, Channel] = {}
+        self._watching_iid: str | None = None
+        self._selected_iid: str | None = None
+        self._watching_bg: str = PALETTE["sel"][0]
+        self._status_colors: dict[str, str] = {
+            "online": "#12b76a", "pending": "#dc6803", "offline": "#6b7280",
+        }
 
-    def _add_column(
-        self,
-        cid: str,
-        name: str,
-        *,
-        anchor: tk._Anchor = "center",
-        width: int | None = None,
-        width_template: str | list[str] | None = None,
-    ):
-        table = self._table
-        # NOTE: we don't do this for the icon column
-        if cid != "#0":
-            # we need to save the column settings and headings before modifying the columns...
-            columns: tuple[str, ...] = table.cget("columns") or ()
-            column_settings: dict[str, tuple[str, tk._Anchor, int, int]] = {}
-            for s_cid in columns:
-                s_column = table.column(s_cid)
-                assert s_column is not None
-                s_heading = table.heading(s_cid)
-                assert s_heading is not None
-                column_settings[s_cid] = (
-                    s_heading["text"], s_heading["anchor"], s_column["width"], s_column["minwidth"]
-                )
-            # ..., then add the column
-            table.config(columns=columns + (cid,))
-            # ..., and then restore column settings and headings afterwards
-            for s_cid, (s_name, s_anchor, s_width, s_minwidth) in column_settings.items():
-                table.heading(s_cid, text=s_name, anchor=s_anchor)
-                table.column(s_cid, minwidth=s_minwidth, width=s_width, stretch=False)
-        # set heading and column settings for the new column
-        if width_template is not None:
-            if isinstance(width_template, str):
-                width = self._measure(width_template)
-            else:
-                width = max((self._measure(template) for template in width_template), default=20)
-            self._const_width.add(cid)
-        assert width is not None
-        table.heading(cid, text=name, anchor=anchor)
-        table.column(cid, minwidth=width, width=width, stretch=False)
+    def _configure_columns(self, frame: ctk.CTkFrame) -> None:
+        for i, (minsize, weight) in enumerate(self._COLUMNS):
+            frame.columnconfigure(i, minsize=minsize, weight=weight)
 
-    def _disable_column_resize(self, event):
-        if self._table.identify_region(event.x, event.y) == "separator":
-            return "break"
+    def configure_theme(
+        self, *, watching_bg: str, online_fg: str, pending_fg: str, offline_fg: str
+    ) -> None:
+        self._watching_bg = watching_bg
+        self._status_colors = {"online": online_fg, "pending": pending_fg, "offline": offline_fg}
+        for iid in self._rows:
+            self._restyle_row(iid)
 
-    def _selected(self, event):
-        selection = self._table.selection()
-        if selection:
-            self._buttons["switch"].config(state="normal")
+    def _restyle_row(self, iid: str) -> None:
+        row = self._rows[iid]
+        if iid == self._selected_iid:
+            bg = PALETTE["sel"]
+        elif iid == self._watching_iid:
+            bg = self._watching_bg
         else:
-            self._buttons["switch"].config(state="disabled")
+            bg = "transparent"
+        row["frame"].configure(fg_color=bg)
+        if iid == self._watching_iid:
+            row["badge"].grid()
+        else:
+            row["badge"].grid_remove()
 
-    def _measure(self, text: str) -> int:
-        # we need this because columns have 9-10 pixels of padding that cuts text off
-        return self._font.measure(text) + 10
-
-    def _redraw(self):
-        # this forces a redraw that recalculates widget width
-        self._table.event_generate("<<ThemeChanged>>")
-
-    def _adjust_width(self, column: str, value: str):
-        # causes the column to expand if the value's width is greater than the current width
-        if column in self._const_width:
+    def _select_row(self, iid: str, _event: tk.Event[Any] | None = None) -> None:
+        if self._selected_iid == iid:
             return
-        value_width = self._measure(value)
-        curr_width = self._table.column(column, "width")
-        if value_width > curr_width:
-            self._table.column(column, width=value_width)
-            self._redraw()
-
-    def shrink(self):
-        # causes the columns to shrink back after long values have been removed from it
-        columns = self._table.cget("columns")
-        iids = self._table.get_children()
-        for column in columns:
-            if column in self._const_width:
-                continue
-            if iids:
-                # table has at least one item
-                width = max(self._measure(self._table.set(i, column)) for i in iids)
-                self._table.column(column, width=width)
-            else:
-                # no items - use minwidth
-                minwidth = self._table.column(column, "minwidth")
-                self._table.column(column, width=minwidth)
-        self._redraw()
-
-    def _set(self, iid: str, column: str, value: str):
-        self._table.set(iid, column, value)
-        self._adjust_width(column, value)
-
-    def _insert(self, iid: str, values: dict[str, str]):
-        to_insert: list[str] = []
-        for cid in self._table.cget("columns"):
-            value = values[cid]
-            to_insert.append(value)
-            self._adjust_width(cid, value)
-        self._table.insert(parent='', index="end", iid=iid, values=to_insert)
-
-    def clear_watching(self):
-        for iid in self._table.tag_has("watching"):
-            self._table.item(iid, tags='')
-
-    def set_watching(self, channel: Channel):
-        self.clear_watching()
-        iid = channel.iid
-        self._table.item(iid, tags="watching")
-        self._table.see(iid)
+        old = self._selected_iid
+        self._selected_iid = iid
+        if old is not None and old in self._rows:
+            self._restyle_row(old)
+        self._restyle_row(iid)
+        self._switch_button.configure(state="normal")
 
     def get_selection(self) -> Channel | None:
-        if not self._channel_map:
+        if self._selected_iid is None:
             return None
-        selection = self._table.selection()
-        if not selection:
-            return None
-        return self._channel_map[selection[0]]
+        return self._channel_map.get(self._selected_iid)
 
-    def clear_selection(self):
-        self._table.selection_set('')
+    def clear_selection(self) -> None:
+        old = self._selected_iid
+        self._selected_iid = None
+        if old is not None and old in self._rows:
+            self._restyle_row(old)
+        self._switch_button.configure(state="disabled")
 
-    def clear(self):
-        iids = self._table.get_children()
-        self._table.delete(*iids)
-        self._channel_map.clear()
-        self.shrink()
+    def clear_watching(self) -> None:
+        old = self._watching_iid
+        self._watching_iid = None
+        if old is not None and old in self._rows:
+            self._restyle_row(old)
 
-    def display(self, channel: Channel, *, add: bool = False):
+    def set_watching(self, channel: Channel) -> None:
+        self.clear_watching()
         iid = channel.iid
-        if not add and iid not in self._channel_map:
+        self._watching_iid = iid
+        if iid in self._rows:
+            self._restyle_row(iid)
+
+    def clear(self) -> None:
+        for row in self._rows.values():
+            row["frame"].destroy()
+        self._rows.clear()
+        self._row_order.clear()
+        self._channel_map.clear()
+        self._watching_iid = None
+        self._selected_iid = None
+
+    def _build_row(self, iid: str) -> _ChannelRow:
+        frame = ctk.CTkFrame(self._rows_area, corner_radius=8, fg_color="transparent")
+        frame.grid(column=0, row=len(self._row_order), sticky="ew", pady=1)
+        self._configure_columns(frame)
+
+        avatar = ctk.CTkLabel(frame, text='', image=self._avatar_icon)
+        avatar.grid(column=0, row=0, pady=7)
+
+        name_box = ctk.CTkFrame(frame, fg_color="transparent")
+        name_box.grid(column=1, row=0, sticky="w")
+        name_label = ctk.CTkLabel(
+            name_box, text='', font=ctk.CTkFont(weight="bold"), text_color=PALETTE["fg"],
+            anchor="w",
+        )
+        name_label.grid(column=0, row=0, sticky="w")
+        badge = ctk.CTkFrame(name_box, corner_radius=999, fg_color=PALETTE["sel"])
+        ctk.CTkLabel(
+            badge,
+            text="WATCHING",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=PALETTE["accent"],
+        ).grid(column=0, row=0, padx=8, pady=2)
+        badge.grid(column=1, row=0, padx=(8, 0))
+        badge.grid_remove()
+
+        game_label = ctk.CTkLabel(frame, text='', text_color=PALETTE["muted"], anchor="w")
+        game_label.grid(column=2, row=0, sticky="w")
+        viewers_label = ctk.CTkLabel(frame, text='', text_color=PALETTE["muted"], anchor="w")
+        viewers_label.grid(column=3, row=0, sticky="w")
+
+        status_box = ctk.CTkFrame(frame, fg_color="transparent")
+        status_box.grid(column=4, row=0, sticky="w")
+        status_dot = ctk.CTkFrame(
+            status_box, width=6, height=6, corner_radius=3, fg_color=PALETTE["muted"],
+        )
+        status_dot.grid(column=0, row=0, padx=(0, 6))
+        status_label = ctk.CTkLabel(status_box, text='', anchor="w")
+        status_label.grid(column=1, row=0, sticky="w")
+
+        row = _ChannelRow(
+            frame=frame,
+            name_label=name_label,
+            badge=badge,
+            game_label=game_label,
+            viewers_label=viewers_label,
+            status_dot=status_dot,
+            status_label=status_label,
+        )
+        for widget in (
+            frame, avatar, name_box, name_label, game_label, viewers_label,
+            status_box, status_dot, status_label,
+        ):
+            widget.bind("<Button-1>", partial(self._select_row, iid))
+        return row
+
+    def display(self, channel: Channel, *, add: bool = False) -> None:
+        iid = channel.iid
+        if iid not in self._channel_map and not add:
             # the channel isn't on the list and we're not supposed to add it
             return
-        # ACL-based
-        acl_based = "✔" if channel.acl_based else "❌"
-        # status
         if channel.online:
             status = _("gui", "channels", "online")
+            status_key = "online"
         elif channel.pending_online:
             status = _("gui", "channels", "pending")
+            status_key = "pending"
         else:
             status = _("gui", "channels", "offline")
-        # game
+            status_key = "offline"
         game = str(channel.game or '')
-        # drops
-        drops = "✔" if channel.drops_enabled else "❌"
-        # viewers
-        viewers = ''
-        if channel.viewers is not None:
-            viewers = str(channel.viewers)
-        if iid in self._channel_map:
-            self._set(iid, "game", game)
-            self._set(iid, "drops", drops)
-            self._set(iid, "status", status)
-            self._set(iid, "viewers", viewers)
-            self._set(iid, "acl_base", acl_based)
-        elif add:
-            self._channel_map[iid] = channel
-            self._insert(
-                iid,
-                {
-                    "game": game,
-                    "drops": drops,
-                    "status": status,
-                    "viewers": viewers,
-                    "acl_base": acl_based,
-                    "channel": channel.name,
-                },
-            )
+        viewers = str(channel.viewers) if channel.viewers is not None else ''
 
-    def remove(self, channel: Channel):
+        if iid in self._rows:
+            row = self._rows[iid]
+        else:
+            self._channel_map[iid] = channel
+            row = self._rows[iid] = self._build_row(iid)
+            self._row_order.append(iid)
+
+        row["name_label"].configure(text=channel.name)
+        row["game_label"].configure(text=game)
+        row["viewers_label"].configure(text=viewers)
+        color = self._status_colors.get(status_key, PALETTE["muted"][0])
+        row["status_label"].configure(text=status, text_color=color)
+        row["status_dot"].configure(fg_color=color)
+        self._restyle_row(iid)
+
+    def remove(self, channel: Channel) -> None:
         iid = channel.iid
+        row = self._rows.pop(iid, None)
+        if row is not None:
+            row["frame"].destroy()
+        if iid in self._row_order:
+            self._row_order.remove(iid)
         del self._channel_map[iid]
-        self._table.delete(iid)
+        if self._watching_iid == iid:
+            self._watching_iid = None
+        if self._selected_iid == iid:
+            self._selected_iid = None
 
 
 class TrayIcon:
@@ -1092,11 +1388,22 @@ class TrayIcon:
             "maint": Image_module.open(resource_path("icons/maint.ico")),
         }
         self._icon_state: str = "pickaxe"
-        self._button = ttk.Button(master, command=self.minimize, text=_("gui", "tray", "minimize"))
+        self._button = ctk.CTkButton(
+            master,
+            command=self.minimize,
+            text=_("gui", "tray", "minimize"),
+            fg_color=PALETTE["surface"],
+            hover_color=PALETTE["border"],
+            text_color=PALETTE["fg"],
+            border_width=1,
+            border_color=PALETTE["border"],
+            width=150,
+            height=30,
+        )
 
         # Hides Tray button for macOS
         if sys.platform != "darwin":
-            self._button.grid(column=0, row=0, sticky="ne")
+            self._button.grid(column=3, row=0, sticky="e", padx=(0, 14), pady=10)
 
     def __del__(self) -> None:
         self.stop()
@@ -1206,34 +1513,63 @@ class TrayIcon:
 
 
 class Notebook:
-    def __init__(self, manager: GUIManager, master: ttk.Widget):
-        self._nb = ttk.Notebook(master)
-        self._nb.grid(column=0, row=0, sticky="nsew")
-        master.rowconfigure(0, weight=1)
+    """
+    Manual tab-switching content area: one CTkFrame per tab, only one gridded
+    (visible) at a time. The actual tab *buttons* live in GUIManager's own top
+    bar (a CTkSegmentedButton, alongside the brand/account chip) and drive this
+    purely through select(name) - this class owns none of that chrome, only
+    the stack of content frames beneath it.
+    """
+    def __init__(self, manager: GUIManager, master: tk.Misc):
+        self._manager = manager
+        # row 0 of master is the top bar (built by GUIManager); tab content goes below it
+        master.rowconfigure(1, weight=1)
         master.columnconfigure(0, weight=1)
-        # prevent entries from being selected after switching tabs
-        self._nb.bind("<<NotebookTabChanged>>", lambda event: manager._root.focus_set())
+        self._master = master
+        self._frames: dict[str, ctk.CTkFrame] = {}
+        self._names: list[str] = []
+        self._current: str | None = None
+        self._view_callbacks: list[abc.Callable[[tk.Event[Any] | None], Any]] = []
 
-    def add_tab(self, widget: ttk.Widget, *, name: str, **kwargs):
-        kwargs.pop("text", None)
-        if "sticky" not in kwargs:
-            kwargs["sticky"] = "nsew"
-        self._nb.add(widget, text=name, **kwargs)
+    def add_tab(self, *, name: str) -> ctk.CTkFrame:
+        frame = ctk.CTkFrame(self._master, fg_color="transparent")
+        frame.grid(column=0, row=1, sticky="nsew")
+        if self._current is None:
+            self._current = name
+        else:
+            frame.grid_remove()
+        self._frames[name] = frame
+        self._names.append(name)
+        return frame
+
+    def select(self, name: str) -> None:
+        if name == self._current or name not in self._frames:
+            return
+        assert self._current is not None
+        self._frames[self._current].grid_remove()
+        self._current = name
+        self._frames[name].grid()
+        # prevent entries from being selected after switching tabs
+        self._manager._root.focus_set()
+        for callback in self._view_callbacks:
+            callback(None)
 
     def current_tab(self) -> int:
-        return self._nb.index("current")
+        if self._current in self._names:
+            return self._names.index(self._current)
+        return 0
 
-    def add_view_event(self, callback: abc.Callable[[tk.Event[ttk.Notebook]], Any]):
-        self._nb.bind("<<NotebookTabChanged>>", callback, True)
+    def add_view_event(self, callback: abc.Callable[[tk.Event[Any] | None], Any]):
+        self._view_callbacks.append(callback)
 
 
 class CampaignDisplay(TypedDict):
-    frame: ttk.Frame
-    status: ttk.Label
+    frame: ctk.CTkFrame
+    status: ctk.CTkLabel
 
 
 class InventoryOverview:
-    def __init__(self, manager: GUIManager, master: ttk.Widget):
+    def __init__(self, manager: GUIManager, master: tk.Misc):
         self._manager = manager
         self._cache: ImageCache = manager._cache
         self._settings: Settings = manager._twitch.settings
@@ -1247,82 +1583,61 @@ class InventoryOverview:
             "finished": IntVar(master, 0),
         }
         manager.tabs.add_view_event(self._on_tab_switched)
+
+        def filter_check(key: str, text_key: str) -> ctk.CTkCheckBox:
+            return ctk.CTkCheckBox(
+                filter_frame,
+                text=_("gui", "inventory", "filter", text_key),
+                variable=self._filters[key],
+                fg_color=PALETTE["accent"],
+                hover_color=PALETTE["accent_hover"],
+                checkmark_color=PALETTE["on_accent"],
+                border_color=PALETTE["border"],
+                text_color=PALETTE["fg"],
+            )
+
         # Filtering options
-        filter_frame = ttk.LabelFrame(
-            master, text=_("gui", "inventory", "filter", "name"), padding=(4, 0, 4, 4)
-        )
-        LABEL_SPACING = 20
-        filter_frame.grid(column=0, row=0, columnspan=2, sticky="nsew")
-        ttk.Label(
-            filter_frame, text=_("gui", "inventory", "filter", "show"), padding=(0, 0, 10, 0)
-        ).grid(column=0, row=0)
+        filter_outer, filter_frame = make_card(master, _("gui", "inventory", "filter", "name"))
+        filter_outer.grid(column=0, row=0, columnspan=2, sticky="nsew")
+        ctk.CTkLabel(
+            filter_frame, text=_("gui", "inventory", "filter", "show"), text_color=PALETTE["fg"]
+        ).grid(column=0, row=0, padx=(0, 10))
         icolumn = 0
-        ttk.Checkbutton(
-            filter_frame, variable=self._filters["not_linked"]
-        ).grid(column=(icolumn := icolumn + 1), row=0)
-        ttk.Label(
+        filter_check("not_linked", "not_linked").grid(
+            column=(icolumn := icolumn + 1), row=0, padx=(0, 16)
+        )
+        filter_check("upcoming", "upcoming").grid(
+            column=(icolumn := icolumn + 1), row=0, padx=(0, 16)
+        )
+        filter_check("expired", "expired").grid(
+            column=(icolumn := icolumn + 1), row=0, padx=(0, 16)
+        )
+        filter_check("excluded", "excluded").grid(
+            column=(icolumn := icolumn + 1), row=0, padx=(0, 16)
+        )
+        filter_check("finished", "finished").grid(
+            column=(icolumn := icolumn + 1), row=0, padx=(0, 16)
+        )
+        ctk.CTkButton(
             filter_frame,
-            text=_("gui", "inventory", "filter", "not_linked"),
-            padding=(0, 0, LABEL_SPACING, 0),
+            text=_("gui", "inventory", "filter", "refresh"),
+            command=self.refresh,
+            fg_color=PALETTE["surface"],
+            hover_color=PALETTE["border"],
+            text_color=PALETTE["accent"],
+            border_width=1,
+            border_color=PALETTE["accent"],
         ).grid(column=(icolumn := icolumn + 1), row=0)
-        ttk.Checkbutton(
-            filter_frame, variable=self._filters["upcoming"]
-        ).grid(column=(icolumn := icolumn + 1), row=0)
-        ttk.Label(
-            filter_frame,
-            text=_("gui", "inventory", "filter", "upcoming"),
-            padding=(0, 0, LABEL_SPACING, 0),
-        ).grid(column=(icolumn := icolumn + 1), row=0)
-        ttk.Checkbutton(
-            filter_frame, variable=self._filters["expired"]
-        ).grid(column=(icolumn := icolumn + 1), row=0)
-        ttk.Label(
-            filter_frame,
-            text=_("gui", "inventory", "filter", "expired"),
-            padding=(0, 0, LABEL_SPACING, 0),
-        ).grid(column=(icolumn := icolumn + 1), row=0)
-        ttk.Checkbutton(
-            filter_frame, variable=self._filters["excluded"]
-        ).grid(column=(icolumn := icolumn + 1), row=0)
-        ttk.Label(
-            filter_frame,
-            text=_("gui", "inventory", "filter", "excluded"),
-            padding=(0, 0, LABEL_SPACING, 0),
-        ).grid(column=(icolumn := icolumn + 1), row=0)
-        ttk.Checkbutton(
-            filter_frame, variable=self._filters["finished"]
-        ).grid(column=(icolumn := icolumn + 1), row=0)
-        ttk.Label(
-            filter_frame,
-            text=_("gui", "inventory", "filter", "finished"),
-            padding=(0, 0, LABEL_SPACING, 0),
-        ).grid(column=(icolumn := icolumn + 1), row=0)
-        ttk.Button(
-            filter_frame, text=_("gui", "inventory", "filter", "refresh"), command=self.refresh
-        ).grid(column=(icolumn := icolumn + 1), row=0)
-        # Inventory view
-        self._canvas = tk.Canvas(master, scrollregion=(0, 0, 0, 0))
-        self._canvas.grid(column=0, row=1, sticky="nsew")
+        # Inventory view - CTkScrollableFrame manages its own scrollbar and mousewheel binding
+        self._main_frame = ctk.CTkScrollableFrame(
+            master, fg_color="transparent", scrollbar_button_color=PALETTE["border"],
+        )
+        self._main_frame.grid(column=0, row=1, columnspan=2, sticky="nsew")
+        self._main_frame.columnconfigure(0, weight=1)
         master.rowconfigure(1, weight=1)
         master.columnconfigure(0, weight=1)
-        xscroll = ttk.Scrollbar(master, orient="horizontal", command=self._canvas.xview)
-        xscroll.grid(column=0, row=2, sticky="ew")
-        yscroll = ttk.Scrollbar(master, orient="vertical", command=self._canvas.yview)
-        yscroll.grid(column=1, row=1, sticky="ns")
-        self._canvas.configure(xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
-        self._canvas.bind("<Configure>", self._canvas_update)
-        self._main_frame = ttk.Frame(self._canvas)
-        self._canvas.bind(
-            "<Enter>", lambda e: self._canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-        )
-        self._canvas.bind("<Leave>", lambda e: self._canvas.unbind_all("<MouseWheel>"))
-        self._canvas.create_window(0, 0, anchor="nw", window=self._main_frame)
         self._campaigns: dict[DropsCampaign, CampaignDisplay] = {}
-        self._drops: dict[str, ttk.Label] = {}
-
-    def configure_theme(self, *, bg: str):
-        # Canvas background needs manual control
-        self._canvas.configure(bg=bg)
+        self._drops: dict[str, ctk.CTkLabel] = {}
 
     def _update_visibility(self, campaign: DropsCampaign):
         # True if the campaign is supposed to show, False makes it hidden.
@@ -1349,7 +1664,7 @@ class InventoryOverview:
         else:
             frame.grid_remove()
 
-    def _on_tab_switched(self, event: tk.Event[ttk.Notebook]) -> None:
+    def _on_tab_switched(self, event: tk.Event[Any] | None) -> None:
         if self._manager.tabs.current_tab() == 1:
             # refresh only if we're switching to the tab
             self.refresh()
@@ -1357,13 +1672,13 @@ class InventoryOverview:
     def get_status(self, campaign: DropsCampaign) -> tuple[str, str]:
         if campaign.active:
             status_text: str = _("gui", "inventory", "status", "active")
-            status_color: str = "green"
+            status_color: str = "#12b76a"
         elif campaign.upcoming:
             status_text = _("gui", "inventory", "status", "upcoming")
-            status_color = "goldenrod"
+            status_color = "#dc6803"
         else:
             status_text = _("gui", "inventory", "status", "expired")
-            status_color = "red"
+            status_color = "#f04438"
         return (status_text, status_color)
 
     def refresh(self):
@@ -1371,38 +1686,36 @@ class InventoryOverview:
             # status
             status_label = self._campaigns[campaign]["status"]
             status_text, status_color = self.get_status(campaign)
-            status_label.config(text=status_text, foreground=status_color)
+            status_label.configure(text=status_text, text_color=status_color)
             # visibility
             self._update_visibility(campaign)
-        self._canvas_update()
-
-    def _canvas_update(self, event: tk.Event[tk.Canvas] | None = None):
-        self._canvas.update_idletasks()
-        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
-
-    def _on_mousewheel(self, event: tk.Event[tk.Misc]):
-        delta = -1 if event.delta > 0 else 1
-        state: int = event.state if isinstance(event.state, int) else 0
-        if state & 1:
-            scroll = self._canvas.xview_scroll
-        else:
-            scroll = self._canvas.yview_scroll
-        scroll(delta, "units")
 
     async def add_campaign(self, campaign: DropsCampaign) -> None:
-        campaign_frame = ttk.Frame(self._main_frame, relief="ridge", borderwidth=1, padding=4)
-        campaign_frame.grid(column=0, row=len(self._campaigns), sticky="nsew", pady=3)
+        campaign_frame = ctk.CTkFrame(
+            self._main_frame,
+            corner_radius=12,
+            fg_color=PALETTE["surface"],
+            border_width=1,
+            border_color=PALETTE["border"],
+        )
+        campaign_frame.grid(column=0, row=len(self._campaigns), sticky="nsew", pady=4, padx=2)
         campaign_frame.rowconfigure(4, weight=1)
         campaign_frame.columnconfigure(1, weight=1)
         campaign_frame.columnconfigure(3, weight=10000)
         # Name
-        ttk.Label(
-            campaign_frame, text=campaign.name, takefocus=False, width=45
-        ).grid(column=0, row=0, columnspan=2, sticky="w")
+        ctk.CTkLabel(
+            campaign_frame,
+            text=campaign.name,
+            takefocus=False,
+            width=320,
+            anchor="w",
+            font=ctk.CTkFont(weight="bold"),
+            text_color=PALETTE["fg"],
+        ).grid(column=0, row=0, columnspan=2, sticky="w", padx=6, pady=(6, 0))
         # Status
         status_text, status_color = self.get_status(campaign)
-        status_label = ttk.Label(
-            campaign_frame, text=status_text, takefocus=False, foreground=status_color
+        status_label = ctk.CTkLabel(
+            campaign_frame, text=status_text, takefocus=False, text_color=status_color,
         )
         status_label.grid(column=1, row=1, sticky="w", padx=4)
         # NOTE: We have to save the campaign's frame and status before any awaits happen,
@@ -1423,24 +1736,24 @@ class InventoryOverview:
             ),
             reverse=campaign.upcoming,
             takefocus=False,
+            text_color=PALETTE["muted"],
         ).grid(column=1, row=2, sticky="w", padx=4)
         # Linking status
         if campaign.eligible:
             link_kwargs = {
-                "style": '',
+                "plain": True,
                 "text": _("gui", "inventory", "status", "linked"),
-                "foreground": "green",
+                "text_color": "#12b76a",
             }
         else:
             link_kwargs = {
                 "text": _("gui", "inventory", "status", "not_linked"),
-                "foreground": "red",
+                "text_color": "#f04438",
             }
         LinkLabel(
             campaign_frame,
             link=campaign.link_url,
             takefocus=False,
-            padding=0,
             **link_kwargs,
         ).grid(column=1, row=3, sticky="w", padx=4)
         # ACL channels
@@ -1455,43 +1768,57 @@ class InventoryOverview:
                 )
         else:
             allowed_text = _("gui", "inventory", "all_channels")
-        ttk.Label(
+        ctk.CTkLabel(
             campaign_frame,
             text=f"{_('gui', 'inventory', 'allowed_channels')}\n{allowed_text}",
             takefocus=False,
-        ).grid(column=1, row=4, sticky="nw", padx=4)
-        # Image
+            justify="left",
+            anchor="w",
+            text_color=PALETTE["muted"],
+        ).grid(column=1, row=4, sticky="nw", padx=4, pady=(0, 6))
+        # Image (stays a plain ttk.Label - CTkLabel's image param expects a CTkImage,
+        # not the plain PIL PhotoImage the cache hands out)
         campaign_image = await self._cache.get(campaign.image_url, size=(108, 144))
-        ttk.Label(campaign_frame, image=campaign_image).grid(column=0, row=1, rowspan=4)
+        ttk.Label(campaign_frame, image=campaign_image).grid(
+            column=0, row=1, rowspan=4, padx=6, pady=6
+        )
         # Drops separator
-        ttk.Separator(
-            campaign_frame, orient="vertical", takefocus=False
-        ).grid(column=2, row=0, rowspan=5, sticky="ns")
+        ctk.CTkFrame(
+            campaign_frame, width=1, fg_color=PALETTE["border"]
+        ).grid(column=2, row=0, rowspan=5, sticky="ns", pady=6)
         # Drops display
-        drops_row = ttk.Frame(campaign_frame)
-        drops_row.grid(column=3, row=0, rowspan=5, sticky="nsew", padx=4)
+        drops_row = ctk.CTkFrame(campaign_frame, fg_color="transparent")
+        drops_row.grid(column=3, row=0, rowspan=5, sticky="nsew", padx=4, pady=6)
         drops_row.rowconfigure(0, weight=1)
         for i, drop in enumerate(campaign.drops):
-            drop_frame = ttk.Frame(drops_row, relief="ridge", borderwidth=1, padding=5)
+            drop_frame = ctk.CTkFrame(
+                drops_row,
+                corner_radius=10,
+                fg_color=PALETTE["bg"],
+                border_width=1,
+                border_color=PALETTE["border"],
+            )
             drop_frame.grid(column=i, row=0, padx=4)
-            benefits_frame = ttk.Frame(drop_frame)
-            benefits_frame.grid(column=0, row=0)
+            benefits_frame = ctk.CTkFrame(drop_frame, fg_color="transparent")
+            benefits_frame.grid(column=0, row=0, padx=5, pady=5)
             benefit_images: list[PhotoImage] = await asyncio.gather(
                 *(self._cache.get(benefit.image_url, (80, 80)) for benefit in drop.benefits)
             )
             for i, benefit, image in zip(range(len(drop.benefits)), drop.benefits, benefit_images):
+                # plain ttk.Label here too, for the same CTkImage-vs-PhotoImage reason as above
                 ttk.Label(
                     benefits_frame,
                     text=benefit.name,
                     image=image,
                     compound="bottom",
                 ).grid(column=i, row=0, padx=5)
-            self._drops[drop.id] = label = ttk.Label(drop_frame, justify=tk.CENTER)
+            self._drops[drop.id] = label = ctk.CTkLabel(
+                drop_frame, justify="center", text_color=PALETTE["fg"]
+            )
             self.update_progress(drop, label)
-            label.grid(column=0, row=1)
+            label.grid(column=0, row=1, pady=(0, 5))
         if self._manager.tabs.current_tab() == 1:
             self._update_visibility(campaign)
-            self._canvas_update()
 
     def clear(self) -> None:
         for child in self._main_frame.winfo_children():
@@ -1499,14 +1826,14 @@ class InventoryOverview:
         self._drops.clear()
         self._campaigns.clear()
 
-    def update_progress(self, drop: TimedDrop, label: ttk.Label) -> None:
+    def update_progress(self, drop: TimedDrop, label: ctk.CTkLabel) -> None:
         progress_text: str
         progress_color: str = ''
         if drop.is_claimed:
-            progress_color = "green"
+            progress_color = "#12b76a"
             progress_text = _("gui", "inventory", "status", "claimed")
         elif drop.can_claim:
-            progress_color = "goldenrod"
+            progress_color = "#dc6803"
             progress_text = _("gui", "inventory", "status", "ready_to_claim")
         elif drop.current_minutes or drop.can_earn():
             progress_text = _("gui", "inventory", "percent_progress").format(
@@ -1536,7 +1863,7 @@ class InventoryOverview:
                 progress_text += '\n' + _("gui", "inventory", "ends").format(
                     time=drop.ends_at.astimezone().replace(microsecond=0, tzinfo=None)
                 )
-        label.config(text=progress_text, foreground=progress_color)
+        label.configure(text=progress_text, text_color=progress_color or PALETTE["fg"])
 
     def update_drop(self, drop: TimedDrop) -> None:
         label = self._drops.get(drop.id)
@@ -1585,7 +1912,7 @@ class SettingsPanel:
             ),
         }
 
-    def __init__(self, manager: GUIManager, master: ttk.Widget):
+    def __init__(self, manager: GUIManager, master: tk.Misc):
         self._manager = manager
         self._settings: Settings = manager._twitch.settings
         priority_mode = self._settings.priority_mode
@@ -1608,158 +1935,194 @@ class SettingsPanel:
             ),
         }
         self._game_names: set[str] = set()
+
+        # Full-bleed 3-column layout: General+Advanced stacked on the left,
+        # Priority and Exclude filling the full height on the right, and a
+        # slim sticky Reload bar across the bottom - replacing the old
+        # everything-crammed-into-one-centered-island layout.
         master.rowconfigure(0, weight=1)
-        master.columnconfigure(0, weight=1)
-        # use a frame to center the content within the tab
-        center_frame = ttk.Frame(master)
-        center_frame.grid(column=0, row=0)
+        master.rowconfigure(1, weight=0)
+        master.columnconfigure(0, weight=3)
+        master.columnconfigure(1, weight=2)
+        master.columnconfigure(2, weight=2)
+
+        def label(parent: tk.Misc, key_path: tuple[str, ...], **kwargs) -> ctk.CTkLabel:
+            kwargs.setdefault("text_color", PALETTE["fg"])
+            kwargs.setdefault("anchor", "w")
+            return ctk.CTkLabel(parent, text=_("gui", *key_path), **kwargs)
+
+        def checkbox(parent: tk.Misc, variable: IntVar, command) -> ctk.CTkCheckBox:
+            return ctk.CTkCheckBox(
+                parent,
+                text='',
+                width=24,
+                variable=variable,
+                command=command,
+                fg_color=PALETTE["accent"],
+                hover_color=PALETTE["accent_hover"],
+                checkmark_color=PALETTE["on_accent"],
+                border_color=PALETTE["border"],
+            )
+
+        def icon_button(parent: tk.Misc, text: str, command, *, size: int = 14) -> ctk.CTkButton:
+            return ctk.CTkButton(
+                parent,
+                text=text,
+                command=command,
+                width=36,
+                font=ctk.CTkFont(size=size),
+                fg_color=PALETTE["surface"],
+                hover_color=PALETTE["border"],
+                text_color=PALETTE["fg"],
+                border_width=1,
+                border_color=PALETTE["border"],
+            )
+
+        def setting_row(parent: tk.Misc, r: int, key_path: tuple[str, ...], control) -> None:
+            label(parent, key_path).grid(column=0, row=r, sticky="w", pady=7)
+            control.grid(column=1, row=r, sticky="e", pady=7)
+
+        left_col = ctk.CTkFrame(master, fg_color="transparent")
+        left_col.grid(column=0, row=0, sticky="nsew", padx=(0, 10))
+        left_col.columnconfigure(0, weight=1)
 
         # General section
-        general_frame = ttk.LabelFrame(
-            center_frame, padding=(4, 0, 4, 4), text=_("gui", "settings", "general", "name")
+        general_outer, general_frame = make_card(
+            left_col, _("gui", "settings", "general", "name")
         )
-        general_frame.grid(column=0, row=0, sticky="nsew")
-        # use another frame to center the options within the section
-        # NOTE: this can be adjusted or removed later on if more options were to be added
-        general_frame.rowconfigure(0, weight=1)
+        general_outer.grid(column=0, row=0, sticky="new", pady=(0, 10))
         general_frame.columnconfigure(0, weight=1)
-        general_center = ttk.Frame(general_frame)
-        general_center.grid(column=0, row=0)
 
-        # language frame
-        language_frame = ttk.Frame(general_center)
-        language_frame.grid(column=0, row=0)
-        ttk.Label(language_frame, text="Language 🌐 (requires restart): ").grid(column=0, row=0)
+        setting_row(
+            general_frame, 0, ("settings", "general", "autostart"),
+            checkbox(general_frame, self._vars["autostart"], self.update_autostart),
+        )
+        self._vars["autostart"].set(self._query_autostart())
+        grow = 1
+        if sys.platform != "darwin":
+            setting_row(
+                general_frame, grow, ("settings", "general", "tray"),
+                checkbox(general_frame, self._vars["tray"], self.update_autostart),
+            )
+            grow += 1
+            setting_row(
+                general_frame, grow, ("settings", "general", "tray_notifications"),
+                checkbox(
+                    general_frame,
+                    self._vars["tray_notifications"],
+                    lambda: setattr(
+                        self._settings,
+                        "tray_notifications",
+                        bool(self._vars["tray_notifications"].get()),
+                    ),
+                ),
+            )
+            grow += 1
+        setting_row(
+            general_frame, grow, ("settings", "general", "dark_mode"),
+            checkbox(general_frame, self._vars["dark_mode"], self.update_dark_mode),
+        )
+        grow += 1
+        setting_row(
+            general_frame, grow, ("settings", "general", "priority_mode"),
+            SelectCombobox(
+                general_frame,
+                command=self.priority_mode,
+                textvariable=self._vars["priority_mode"],
+                values=list(self.PRIORITY_MODES.values()),
+            ),
+        )
+        grow += 1
+        ctk.CTkLabel(
+            general_frame, text="Language 🌐 (requires restart)", text_color=PALETTE["fg"],
+            anchor="w",
+        ).grid(column=0, row=grow, sticky="w", pady=7)
         SelectCombobox(
-            language_frame,
+            general_frame,
             values=list(_.languages),
             textvariable=self._vars["language"],
             command=lambda e: setattr(self._settings, "language", self._vars["language"].get()),
-        ).grid(column=1, row=0)
+        ).grid(column=1, row=grow, sticky="e", pady=7)
+        grow += 1
 
-        # checkboxes frame
-        checkboxes_frame = ttk.Frame(general_center)
-        checkboxes_frame.grid(column=0, row=1)
-        ttk.Label(
-            checkboxes_frame, text=_("gui", "settings", "general", "autostart")
-        ).grid(column=0, row=(irow := 0), sticky="e")
-        ttk.Checkbutton(
-            checkboxes_frame, variable=self._vars["autostart"], command=self.update_autostart
-        ).grid(column=1, row=irow, sticky="w")
-        self._vars["autostart"].set(self._query_autostart())
-        if sys.platform != "darwin":
-            ttk.Label(
-                checkboxes_frame, text=_("gui", "settings", "general", "tray")
-            ).grid(column=0, row=(irow := irow + 1), sticky="e")
-            ttk.Checkbutton(
-                checkboxes_frame, variable=self._vars["tray"], command=self.update_autostart
-            ).grid(column=1, row=irow, sticky="w")
-            ttk.Label(
-                checkboxes_frame, text=_("gui", "settings", "general", "tray_notifications")
-            ).grid(column=0, row=(irow := irow + 1), sticky="e")
-            ttk.Checkbutton(
-                checkboxes_frame,
-                variable=self._vars["tray_notifications"],
-                command=lambda: setattr(
-                    self._settings,
-                    "tray_notifications",
-                    bool(self._vars["tray_notifications"].get()),
-                ),
-            ).grid(column=1, row=irow, sticky="w")
-        ttk.Label(
-            checkboxes_frame, text=_("gui", "settings", "general", "dark_mode")
-        ).grid(column=0, row=(irow := irow + 1), sticky="e")
-        ttk.Checkbutton(
-            checkboxes_frame,
-            variable=self._vars["dark_mode"],
-            command=self.update_dark_mode,
-        ).grid(column=1, row=irow, sticky="w")
-        ttk.Label(
-            checkboxes_frame, text=_("gui", "settings", "general", "priority_mode")
-        ).grid(column=0, row=(irow := irow + 1), sticky="e")
-        SelectCombobox(
-            checkboxes_frame,
-            command=self.priority_mode,
-            textvariable=self._vars["priority_mode"],
-            values=list(self.PRIORITY_MODES.values()),
-        ).grid(column=1, row=irow, sticky="w")
-
-        # proxy frame
-        proxy_frame = ttk.Frame(general_center)
-        proxy_frame.grid(column=0, row=2)
-        ttk.Label(proxy_frame, text=_("gui", "settings", "general", "proxy")).grid(column=0, row=0)
+        make_separator(general_frame).grid(
+            column=0, row=grow, columnspan=2, sticky="ew", pady=10
+        )
+        grow += 1
+        label(general_frame, ("settings", "general", "proxy")).grid(
+            column=0, row=grow, columnspan=2, sticky="w"
+        )
+        grow += 1
         self._proxy = PlaceholderEntry(
-            proxy_frame,
-            width=37,
+            general_frame,
             validate="focusout",
             prefill="http://",
             textvariable=self._vars["proxy"],
             placeholder="http://username:password@address:port",
         )
-        self._proxy.config(validatecommand=partial(proxy_validate, self._proxy, self._settings))
-        self._proxy.grid(column=0, row=1)
+        self._proxy.configure(validatecommand=partial(proxy_validate, self._proxy, self._settings))
+        self._proxy.grid(column=0, row=grow, columnspan=2, sticky="ew", pady=(4, 0))
 
         # Advanced section
-        advanced_frame = ttk.LabelFrame(
-            center_frame, padding=(4, 0, 4, 4), text=_("gui", "settings", "advanced", "name")
+        advanced_outer, advanced_frame = make_card(
+            left_col, _("gui", "settings", "advanced", "name")
         )
-        advanced_frame.grid(column=0, row=1, sticky="nsew")
+        advanced_outer.grid(column=0, row=1, sticky="new")
         advanced_frame.columnconfigure(0, weight=1)
-        advanced_frame.rowconfigure(0, weight=1)
-        advanced_center = ttk.Frame(advanced_frame)
-        advanced_center.grid(column=0, row=0)
 
-        # Warning message
-        ttk.Label(
-            advanced_center, text=_("gui", "settings", "advanced", "warning"), foreground="red"
-        ).grid(column=0, row=(irow := 0), columnspan=2)
-        ttk.Label(
-            advanced_center,
+        ctk.CTkLabel(
+            advanced_frame,
+            text=_("gui", "settings", "advanced", "warning"),
+            text_color=PALETTE["danger"],
+            font=ctk.CTkFont(weight="bold"),
+            anchor="w",
+        ).grid(column=0, row=0, columnspan=2, sticky="w")
+        ctk.CTkLabel(
+            advanced_frame,
             text=_("gui", "settings", "advanced", "warning_text"),
-            foreground="goldenrod",
-        ).grid(column=0, row=(irow := irow + 1), columnspan=2)
-        # Toggles for badges and emotes, and available drops check
-        ttk.Label(
-            advanced_center, text=_("gui", "settings", "advanced", "enable_badges_emotes")
-        ).grid(column=0, row=(irow := irow + 1), sticky="e")
-        ttk.Checkbutton(
-            advanced_center,
-            variable=self._vars["enable_badges_emotes"],
-            command=lambda: setattr(
-                self._settings,
-                "enable_badges_emotes",
-                bool(self._vars["enable_badges_emotes"].get()),
+            text_color=PALETTE["warn"],
+            anchor="w",
+            justify="left",
+        ).grid(column=0, row=1, columnspan=2, sticky="w", pady=(2, 10))
+        setting_row(
+            advanced_frame, 2, ("settings", "advanced", "enable_badges_emotes"),
+            checkbox(
+                advanced_frame,
+                self._vars["enable_badges_emotes"],
+                lambda: setattr(
+                    self._settings,
+                    "enable_badges_emotes",
+                    bool(self._vars["enable_badges_emotes"].get()),
+                ),
             ),
-        ).grid(column=1, row=irow, sticky="w")
-        ttk.Label(
-            advanced_center, text=_("gui", "settings", "advanced", "available_drops_check")
-        ).grid(column=0, row=(irow := irow + 1), sticky="e")
-        ttk.Checkbutton(
-            advanced_center,
-            variable=self._vars["available_drops_check"],
-            command=lambda: setattr(
-                self._settings,
-                "available_drops_check",
-                bool(self._vars["available_drops_check"].get()),
-            ),
-        ).grid(column=1, row=irow, sticky="w")
-
-        # Priority section
-        priority_frame = ttk.LabelFrame(
-            center_frame, padding=(4, 0, 4, 4), text=_("gui", "settings", "priority")
         )
-        priority_frame.grid(column=1, row=0, rowspan=2, sticky="nsew")
-        self._priority_entry = PlaceholderCombobox(
-            priority_frame, placeholder=_("gui", "settings", "game_name"), width=30
+        setting_row(
+            advanced_frame, 3, ("settings", "advanced", "available_drops_check"),
+            checkbox(
+                advanced_frame,
+                self._vars["available_drops_check"],
+                lambda: setattr(
+                    self._settings,
+                    "available_drops_check",
+                    bool(self._vars["available_drops_check"].get()),
+                ),
+            ),
+        )
+
+        # Priority section - fills the full column height
+        priority_outer, priority_frame = make_card(master, _("gui", "settings", "priority"))
+        priority_outer.grid(column=1, row=0, sticky="nsew", padx=(0, 10))
+        priority_frame.columnconfigure(0, weight=1)
+        priority_frame.rowconfigure(1, weight=1)
+        self._priority_entry = PlaceholderComboBox(
+            priority_frame, placeholder=_("gui", "settings", "game_name")
         )
         self._priority_entry.grid(column=0, row=0, sticky="ew")
-        priority_frame.columnconfigure(0, weight=1)
-        ttk.Button(
-            priority_frame, text="➕", command=self.priority_add, width=3, style="Large.TButton"
+        icon_button(
+            priority_frame, "➕", self.priority_add
         ).grid(column=1, row=0, sticky="nsew")
         self._priority_list = PaddedListbox(
             priority_frame,
-            height=12,
             padding=(1, 0),
             activestyle="none",
             selectmode="single",
@@ -1769,58 +2132,41 @@ class SettingsPanel:
         self._priority_list.grid(column=0, row=1, rowspan=5, sticky="nsew")
         self._priority_list.insert("end", *self._settings.priority)
         weight_scale: int = 5
-        ttk.Button(  # Move to top
-            priority_frame,
-            width=2,
-            text="⇈",
-            style="Arrow.TButton",
-            command=partial(self.priority_move, MAX_INT),
+        icon_button(  # Move to top
+            priority_frame, "⇈", partial(self.priority_move, MAX_INT), size=16,
         ).grid(column=1, row=1, sticky="nsew")
         priority_frame.rowconfigure(1, weight=1)
-        ttk.Button(  # Move up
-            priority_frame,
-            width=2,
-            text="↑",
-            style="Arrow.TButton",
-            command=partial(self.priority_move, 1),
+        icon_button(  # Move up
+            priority_frame, "↑", partial(self.priority_move, 1), size=16,
         ).grid(column=1, row=2, sticky="nsew")
         priority_frame.rowconfigure(2, weight=weight_scale)
-        ttk.Button(  # Move down
-            priority_frame,
-            width=2,
-            text="↓",
-            style="Arrow.TButton",
-            command=partial(self.priority_move, -1),
+        icon_button(  # Move down
+            priority_frame, "↓", partial(self.priority_move, -1), size=16,
         ).grid(column=1, row=3, sticky="nsew")
         priority_frame.rowconfigure(3, weight=weight_scale)
-        ttk.Button(  # Move to bottom
-            priority_frame,
-            width=2,
-            text="⇊",
-            style="Arrow.TButton",
-            command=partial(self.priority_move, -MAX_INT),
+        icon_button(  # Move to bottom
+            priority_frame, "⇊", partial(self.priority_move, -MAX_INT), size=16,
         ).grid(column=1, row=4, sticky="nsew")
         priority_frame.rowconfigure(4, weight=1)
-        ttk.Button(
-            priority_frame, text="❌", command=self.priority_delete, width=3, style="Large.TButton"
+        icon_button(
+            priority_frame, "❌", self.priority_delete
         ).grid(column=1, row=5, sticky="nsew")
         priority_frame.rowconfigure(5, weight=1)
 
-        # Exclude section
-        exclude_frame = ttk.LabelFrame(
-            center_frame, padding=(4, 0, 4, 4), text=_("gui", "settings", "exclude")
-        )
-        exclude_frame.grid(column=2, row=0, rowspan=2, sticky="nsew")
-        self._exclude_entry = PlaceholderCombobox(
-            exclude_frame, placeholder=_("gui", "settings", "game_name"), width=26
+        # Exclude section - fills the full column height
+        exclude_outer, exclude_frame = make_card(master, _("gui", "settings", "exclude"))
+        exclude_outer.grid(column=2, row=0, sticky="nsew")
+        exclude_frame.columnconfigure(0, weight=1)
+        exclude_frame.rowconfigure(1, weight=1)
+        self._exclude_entry = PlaceholderComboBox(
+            exclude_frame, placeholder=_("gui", "settings", "game_name")
         )
         self._exclude_entry.grid(column=0, row=0, sticky="ew")
-        ttk.Button(
-            exclude_frame, text="➕", command=self.exclude_add, width=3, style="Large.TButton"
+        icon_button(
+            exclude_frame, "➕", self.exclude_add
         ).grid(column=1, row=0)
         self._exclude_list = PaddedListbox(
             exclude_frame,
-            height=12,
             padding=(1, 0),
             activestyle="none",
             selectmode="single",
@@ -1828,22 +2174,31 @@ class SettingsPanel:
             exportselection=False,
         )
         self._exclude_list.grid(column=0, row=1, columnspan=2, sticky="nsew")
-        exclude_frame.rowconfigure(1, weight=1)
         # insert them alphabetically
         self._exclude_list.insert("end", *sorted(self._settings.exclude))
-        ttk.Button(
-            exclude_frame, text="❌", command=self.exclude_delete, width=3, style="Large.TButton"
+        icon_button(
+            exclude_frame, "❌", self.exclude_delete
         ).grid(column=0, row=2, columnspan=2, sticky="nsew")
 
-        # Reload button
-        reload_frame = ttk.Frame(center_frame)
-        reload_frame.grid(column=0, row=2, columnspan=3, pady=4)
-        ttk.Label(reload_frame, text=_("gui", "settings", "reload_text")).grid(column=0, row=0)
-        ttk.Button(
-            reload_frame,
+        # Reload bar - a slim sticky footer spanning all 3 columns
+        reload_outer, reload_body = make_card(master, None)
+        reload_outer.grid(column=0, row=1, columnspan=3, sticky="ew", pady=(10, 0))
+        reload_body.columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            reload_body,
+            text=_("gui", "settings", "reload_text"),
+            text_color=PALETTE["muted"],
+            anchor="w",
+        ).grid(column=0, row=0, sticky="w")
+        ctk.CTkButton(
+            reload_body,
             text=_("gui", "settings", "reload"),
             command=self._manager._twitch.state_change(State.INVENTORY_FETCH),
-        ).grid(column=1, row=0)
+            font=ctk.CTkFont(weight="bold"),
+            fg_color=PALETTE["accent"],
+            hover_color=PALETTE["accent_hover"],
+            text_color=PALETTE["on_accent"],
+        ).grid(column=1, row=0, sticky="e")
 
     def clear_selection(self) -> None:
         self._priority_list.selection_clear(0, "end")
@@ -1958,12 +2313,12 @@ class SettingsPanel:
                 plist_file.unlink(missing_ok=True)
 
     def update_excluded_choices(self) -> None:
-        self._exclude_entry.config(
+        self._exclude_entry.configure(
             values=sorted(self._game_names.difference(self._settings.exclude))
         )
 
     def update_priority_choices(self) -> None:
-        self._priority_entry.config(
+        self._priority_entry.configure(
             values=sorted(self._game_names.difference(self._settings.priority))
         )
 
@@ -2090,40 +2445,42 @@ class SettingsPanel:
 class HelpTab:
     WIDTH = 800
 
-    def __init__(self, manager: GUIManager, master: ttk.Widget):
+    def __init__(self, manager: GUIManager, master: tk.Misc):
         self._twitch = manager._twitch
         master.rowconfigure(0, weight=1)
         master.columnconfigure(0, weight=1)
         # use a frame to center the content within the tab
-        center_frame = ttk.Frame(master)
+        center_frame = ctk.CTkFrame(master, fg_color="transparent")
         center_frame.grid(column=0, row=0)
         # use a frame for the bottom row specifically
-        bottom_frame = ttk.Frame(master)
+        bottom_frame = ctk.CTkFrame(master, fg_color="transparent")
         bottom_frame.grid(column=0, row=1, sticky="nsew")
         irow = 0
         # About
-        about = ttk.LabelFrame(center_frame, padding=(4, 0, 4, 4), text="About")
-        about.grid(column=0, row=(irow := irow + 1), sticky="nsew", padx=2)
+        about_outer, about = make_card(center_frame, "About")
+        about_outer.grid(column=0, row=(irow := irow + 1), sticky="nsew", padx=2, pady=4)
         about.columnconfigure(2, weight=1)
         # About - created by
-        ttk.Label(
-            about, text="Application created by: ", anchor="e"
+        ctk.CTkLabel(
+            about, text="Application created by: ", anchor="e", text_color=PALETTE["fg"]
         ).grid(column=0, row=0, sticky="nsew")
         LinkLabel(
             about, link="https://github.com/DevilXD", text="DevilXD"
         ).grid(column=1, row=0, sticky="nsew")
         # About - repo link
-        ttk.Label(about, text="Repository: ", anchor="e").grid(column=0, row=1, sticky="nsew")
+        ctk.CTkLabel(
+            about, text="Repository: ", anchor="e", text_color=PALETTE["fg"]
+        ).grid(column=0, row=1, sticky="nsew")
         LinkLabel(
             about,
             link="https://github.com/DevilXD/TwitchDropsMiner",
             text="https://github.com/DevilXD/TwitchDropsMiner",
         ).grid(column=1, row=1, sticky="nsew")
         # About - donate
-        ttk.Separator(
-            about, orient="horizontal"
-        ).grid(column=0, row=2, columnspan=3, sticky="nsew")
-        ttk.Label(about, text="Donate: ", anchor="e").grid(column=0, row=3, sticky="nsew")
+        make_separator(about).grid(column=0, row=2, columnspan=3, sticky="ew", pady=4)
+        ctk.CTkLabel(
+            about, text="Donate: ", anchor="e", text_color=PALETTE["fg"]
+        ).grid(column=0, row=3, sticky="nsew")
         LinkLabel(
             about,
             link="https://www.buymeacoffee.com/DevilXD",
@@ -2132,12 +2489,11 @@ class HelpTab:
                 "please consider donating a small amount of money to support me. Thank you!"
             ),
             wraplength=self.WIDTH,
+            justify="left",
         ).grid(column=1, row=3, sticky="nsew")
         # Useful links
-        links = ttk.LabelFrame(
-            center_frame, padding=(4, 0, 4, 4), text=_("gui", "help", "links", "name")
-        )
-        links.grid(column=0, row=(irow := irow + 1), sticky="nsew", padx=2)
+        links_outer, links = make_card(center_frame, _("gui", "help", "links", "name"))
+        links_outer.grid(column=0, row=(irow := irow + 1), sticky="nsew", padx=2, pady=4)
         LinkLabel(
             links,
             link="https://www.twitch.tv/drops/inventory",
@@ -2149,35 +2505,44 @@ class HelpTab:
             text=_("gui", "help", "links", "campaigns"),
         ).grid(column=0, row=1, sticky="nsew")
         # How It Works
-        howitworks = ttk.LabelFrame(
-            center_frame, padding=(4, 0, 4, 4), text=_("gui", "help", "how_it_works")
-        )
-        howitworks.grid(column=0, row=(irow := irow + 1), sticky="nsew", padx=2)
-        ttk.Label(
-            howitworks, text=_("gui", "help", "how_it_works_text"), wraplength=self.WIDTH
+        howitworks_outer, howitworks = make_card(center_frame, _("gui", "help", "how_it_works"))
+        howitworks_outer.grid(column=0, row=(irow := irow + 1), sticky="nsew", padx=2, pady=4)
+        ctk.CTkLabel(
+            howitworks,
+            text=_("gui", "help", "how_it_works_text"),
+            wraplength=self.WIDTH,
+            justify="left",
+            text_color=PALETTE["fg"],
         ).grid(sticky="nsew")
-        getstarted = ttk.LabelFrame(
-            center_frame, padding=(4, 0, 4, 4), text=_("gui", "help", "getting_started")
-        )
-        getstarted.grid(column=0, row=(irow := irow + 1), sticky="nsew", padx=2)
-        ttk.Label(
-            getstarted, text=_("gui", "help", "getting_started_text"), wraplength=self.WIDTH
+        getstarted_outer, getstarted = make_card(center_frame, _("gui", "help", "getting_started"))
+        getstarted_outer.grid(column=0, row=(irow := irow + 1), sticky="nsew", padx=2, pady=4)
+        ctk.CTkLabel(
+            getstarted,
+            text=_("gui", "help", "getting_started_text"),
+            wraplength=self.WIDTH,
+            justify="left",
+            text_color=PALETTE["fg"],
         ).grid(sticky="nsew")
 
         # Invalidate button
-        invalidate_frame = ttk.Frame(bottom_frame)
+        invalidate_frame = ctk.CTkFrame(bottom_frame, fg_color="transparent")
         bottom_frame.columnconfigure(0, weight=1)  # center within the column
         invalidate_frame.grid(column=0, row=0, sticky="nse")
-        ttk.Label(
-            invalidate_frame, text=_("gui", "help", "invalidate", "text")
+        ctk.CTkLabel(
+            invalidate_frame,
+            text=_("gui", "help", "invalidate", "text"),
+            text_color=PALETTE["fg"],
         ).grid(column=0, row=0)
-        self._invalidate_button: ttk.Button = ttk.Button(
+        self._invalidate_button = ctk.CTkButton(
             invalidate_frame,
             text=_("gui", "help", "invalidate", "button"),
             command=self.invalidate_token,
             state="disabled",
+            fg_color=PALETTE["danger"],
+            hover_color=PALETTE["warn"],
+            text_color=PALETTE["on_accent"],
         )
-        self._invalidate_button.grid(column=1, row=0)
+        self._invalidate_button.grid(column=1, row=0, padx=(8, 0))
 
     def invalidate_token(self) -> None:
         # sync to async bridge
@@ -2210,7 +2575,10 @@ class GUIManager:
         self._twitch: Twitch = twitch
         self._poll_task: asyncio.Task[NoReturn] | None = None
         self._close_requested = asyncio.Event()
-        self._root = root = Tk(className=WINDOW_TITLE)
+        # set the appearance mode before building any CTk widget, so nothing is ever
+        # constructed in the wrong (System-detected) mode even for a single frame
+        ctk.set_appearance_mode("dark" if twitch.settings.dark_mode else "light")
+        self._root = root = ctk.CTk(className=WINDOW_TITLE)
         # withdraw immediately to prevent the window from flashing
         self._root.withdraw()
         # root.resizable(False, True)
@@ -2220,75 +2588,136 @@ class GUIManager:
         # Image cache for displaying images
         self._cache = ImageCache(self)
 
-        # style adjustements
+        # style adjustements - only a couple of plain ttk.Label/Frame widgets remain
+        # (image-bearing labels - see InventoryOverview.add_campaign), everything else
+        # is CustomTkinter and is themed via the PALETTE (light, dark) tuples
         self._style = style = ttk.Style(root)
-        # theme
-        theme = ''
-        # theme = style.theme_names()[6]
-        # style.theme_use(theme)
-        # fix treeview's background color from tags not working (also see '_fixed_map')
-        style.map(
-            "Treeview",
-            foreground=self._fixed_map("foreground"),
-            background=self._fixed_map("background"),
-        )
-        # add padding to the tab names
-        style.configure("TNotebook.Tab", padding=[8, 4])
-        # Skip these for classic theme or macOS
-        if theme != "classic" and sys.platform != "darwin":
-            # remove Notebook.focus from the Notebook.Tab layout tree to avoid an ugly dotted line
-            # on tab selection. We fold the Notebook.focus children into Notebook.padding children.
-            original = style.layout("TNotebook.Tab")
-            sublayout = original[0][1]["children"][0][1]
-            sublayout["children"] = sublayout["children"][0][1]["children"]
-            style.layout("TNotebook.Tab", original)
-            # remove Checkbutton.focus dotted line from checkbuttons
-            style.configure("TCheckbutton", padding=0)
-            original = style.layout("TCheckbutton")
-            sublayout = original[0][1]["children"]
-            sublayout[1] = sublayout[1][1]["children"][0]
-            del original[0][1]["children"][1]
-            style.layout("TCheckbutton", original)
-        # label style - green, yellow and red text
-        style.configure("green.TLabel", foreground="green")
-        style.configure("yellow.TLabel", foreground="goldenrod")
-        style.configure("red.TLabel", foreground="red")
-        # fonts storage
-        self._fonts: dict[str, Font] = {}
+        if sys.platform != "darwin":
+            style.theme_use("clam")
         # end of style changes
 
-        root_frame = ttk.Frame(root, padding=8)
-        root_frame.grid(column=0, row=0, sticky="nsew")
+        root_frame = ctk.CTkFrame(root, fg_color="transparent")
+        root_frame.grid(column=0, row=0, sticky="nsew", padx=8, pady=8)
         root.rowconfigure(0, weight=1)
         root.columnconfigure(0, weight=1)
-        # Notebook
+        root_frame.rowconfigure(1, weight=1)
+        root_frame.columnconfigure(0, weight=1)
+
+        # Top bar: brand, nav pills, account status, tray button - all in one row
+        topbar = ctk.CTkFrame(
+            root_frame,
+            corner_radius=14,
+            fg_color=PALETTE["surface"],
+            border_width=1,
+            border_color=PALETTE["border"],
+        )
+        topbar.grid(column=0, row=0, sticky="ew", pady=(0, 10))
+        topbar.columnconfigure(1, weight=1)
+        brand = ctk.CTkFrame(topbar, fg_color="transparent")
+        brand.grid(column=0, row=0, sticky="w", padx=14, pady=10)
+        # kept open deliberately - CTkImage converts it lazily, not at construction time
+        brand_icon = ctk.CTkImage(
+            light_image=Image_module.open(resource_path("icons/pickaxe.ico")), size=(30, 30)
+        )
+        ctk.CTkLabel(brand, text="", image=brand_icon).grid(column=0, row=0)
+        ctk.CTkLabel(
+            brand,
+            text="Drops Miner",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            text_color=PALETTE["fg"],
+        ).grid(column=1, row=0, padx=(10, 0))
+
+        # Notebook (manual tab-switching content area, below the top bar)
         self.tabs = Notebook(self, root_frame)
-        # Tray icon - place after notebook so it draws on top of the tabs space
-        self.tray = TrayIcon(self, root_frame)
-        # Main tab
-        main_frame = ttk.Frame(root_frame, padding=8)
-        self.tabs.add_tab(main_frame, name=_("gui", "tabs", "main"))
-        self.status = StatusBar(self, main_frame)
-        self.websockets = WebsocketStatus(self, main_frame)
-        self.login = LoginForm(self, main_frame)
-        self.progress = CampaignProgress(self, main_frame)
-        self.output = ConsoleOutput(self, main_frame)
-        self.channels = ChannelList(self, main_frame)
+
+        nav_values = [
+            _("gui", "tabs", "main"),
+            _("gui", "tabs", "inventory"),
+            _("gui", "tabs", "settings"),
+            _("gui", "tabs", "help"),
+        ]
+        # Custom nav pills instead of CTkSegmentedButton: the mockup's active tab is a
+        # white pill with violet text on a tinted track, but CTkSegmentedButton only
+        # supports one text_color for every segment (selected and not), so it can't
+        # tell them apart the way the mockup does - plain CTkButtons can.
+        nav_track = ctk.CTkFrame(topbar, corner_radius=10, fg_color=PALETTE["bg"])
+        nav_track.grid(column=1, row=0)
+        self._nav_buttons: dict[str, ctk.CTkButton] = {}
+
+        def select_nav(name: str) -> None:
+            self.tabs.select(name)
+            for btn_name, btn in self._nav_buttons.items():
+                active = btn_name == name
+                btn.configure(
+                    fg_color=PALETTE["surface"] if active else "transparent",
+                    text_color=PALETTE["accent"] if active else PALETTE["muted"],
+                )
+
+        for i, name in enumerate(nav_values):
+            btn = ctk.CTkButton(
+                nav_track,
+                text=name,
+                corner_radius=8,
+                fg_color="transparent",
+                hover_color=PALETTE["border"],
+                text_color=PALETTE["muted"],
+                font=ctk.CTkFont(weight="bold"),
+                command=partial(select_nav, name),
+            )
+            btn.grid(column=i, row=0, padx=3, pady=3)
+            self._nav_buttons[name] = btn
+        # mark the first tab active without re-selecting it (Notebook already starts there)
+        self._nav_buttons[nav_values[0]].configure(
+            fg_color=PALETTE["surface"], text_color=PALETTE["accent"]
+        )
+
+        # Tray icon - minimize button, far right of the top bar
+        self.tray = TrayIcon(self, topbar)
+
+        # Main tab: a flexible left column (hero + channels) and a FIXED-width
+        # right sidebar (account/login, connection, activity log), matching the
+        # Clarity mockup's fixed ~360px sidebar rather than a proportional split
+        # (which turned out to depend unpredictably on each side's natural
+        # content size instead of the weight ratio).
+        main_frame = self.tabs.add_tab(name=nav_values[0])
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=0)
+        main_frame.rowconfigure(0, weight=1)
+        main_left = ctk.CTkFrame(main_frame, fg_color="transparent")
+        main_left.grid(column=0, row=0, sticky="nsew", padx=(0, 10))
+        main_left.columnconfigure(0, weight=1)
+        main_left.rowconfigure(1, weight=1)
+        main_right = ctk.CTkFrame(main_frame, fg_color="transparent", width=360)
+        main_right.grid(column=1, row=0, sticky="ns")
+        main_right.grid_propagate(False)
+        main_right.columnconfigure(0, weight=1)
+        main_right.rowconfigure(2, weight=1)
+
+        self.progress = CampaignProgress(self, main_left)
+        self.status = StatusBar(self, self.progress.badge_slot)
+        self.channels = ChannelList(self, main_left)
+        self.login = LoginForm(self, main_right)
+        self.websockets = WebsocketStatus(self, main_right)
+        self.output = ConsoleOutput(self, main_right)
         # Inventory tab
-        inv_frame = ttk.Frame(root_frame, padding=8)
+        inv_frame = self.tabs.add_tab(name=_("gui", "tabs", "inventory"))
         self.inv = InventoryOverview(self, inv_frame)
-        self.tabs.add_tab(inv_frame, name=_("gui", "tabs", "inventory"))
         # Settings tab
-        settings_frame = ttk.Frame(root_frame, padding=8)
+        settings_frame = self.tabs.add_tab(name=_("gui", "tabs", "settings"))
         self.settings = SettingsPanel(self, settings_frame)
-        self.tabs.add_tab(settings_frame, name=_("gui", "tabs", "settings"))
         # Help tab
-        help_frame = ttk.Frame(root_frame, padding=8)
+        help_frame = self.tabs.add_tab(name=_("gui", "tabs", "help"))
         self.help = HelpTab(self, help_frame)
-        self.tabs.add_tab(help_frame, name=_("gui", "tabs", "help"))
-        # clamp minimum window size (update geometry first)
+        # clamp minimum window size (update geometry first), and open at the same
+        # size as the Clarity mockup's canvas instead of whatever width the sum of
+        # natural widget sizes happens to add up to
         root.update_idletasks()
-        root.minsize(width=root.winfo_reqwidth(), height=root.winfo_reqheight())
+        root.minsize(width=1000, height=700)
+        # Windows can restore a maximized state for this window from a previous run
+        # regardless of geometry() below - force it back to a normal, un-maximized
+        # window first so the 1440x900 size below actually takes effect.
+        root.state("normal")
+        root.geometry("1440x900")
         # register logging handler
         self._handler = _TKOutputHandler(self)
         self._handler.setFormatter(OUTPUT_FORMATTER)
@@ -2320,11 +2749,7 @@ class GUIManager:
             # use old-style window closing protocol for non-windows platforms
             root.protocol("WM_DELETE_WINDOW", self.close)
             root.protocol("WM_DESTROY_WINDOW", self.close)
-        # Save current theme and apply palette after widgets are created
-        try:
-            self._orig_theme_name = self._style.theme_use()
-        except Exception:
-            self._orig_theme_name = ''
+        # Apply the full palette now that all widgets have been created
         self.apply_theme(self._twitch.settings.dark_mode)
         # stay hidden in tray if needed, otherwise show the window when everything's ready
         if self._twitch.settings.tray and sys.platform != "darwin":
@@ -2332,21 +2757,6 @@ class GUIManager:
             self._root.after_idle(self.tray.minimize)
         else:
             self._root.after_idle(self._root.deiconify)
-
-    # https://stackoverflow.com/questions/56329342/tkinter-treeview-background-tag-not-working
-    def _fixed_map(self, option):
-        # Fix for setting text colour for Tkinter 8.6.9
-        # From: https://core.tcl.tk/tk/info/509cafafae
-        #
-        # Returns the style map for 'option' with any styles starting with
-        # ('!disabled', '!selected', ...) filtered out.
-
-        # style.map() returns an empty list for missing options, so this
-        # should be future-safe.
-        return [
-            elm for elm in self._style.map("Treeview", query_opt=option)
-            if elm[:2] != ("!disabled", "!selected")
-        ]
 
     def wnd_proc(self, hwnd, msg, w_param, l_param):
         """
@@ -2504,40 +2914,13 @@ class GUIManager:
 
     def apply_theme(self, dark: bool) -> None:
         """
-        Apply dark/light palette to ttk styles and Tk widgets in a minimal, non-invasive way.
+        Switch CustomTkinter's global appearance mode (every CTk widget built with
+        a (light, dark) PALETTE tuple re-colors itself automatically), then manually
+        re-theme the handful of things that aren't CTk and so aren't appearance-mode
+        aware: ttk's Treeview + its Scrollbar (CustomTkinter has no table/treeview
+        widget), the priority/exclude tk.Listbox-es (same reason), and OS-level chrome.
         """
-        # Palette
-        if dark:
-            # Switch to a configurable ttk theme for better color control
-            if sys.platform != "darwin" and self._style.theme_use() != "clam":
-                self._style.theme_use("clam")
-            bg = "#1e1e1e"
-            fg = "#e6e6e6"
-            sel_bg = "#094771"
-            sel_fg = "#ffffff"
-            link = "#4ea3ff"
-            surface = "#252525"
-            header = "#2a2a2a"
-            fieldbg = "#2b2b2b"
-            border = "#3c3c3c"
-            muted = "#b3b3b3"
-            accent = "#0d99ff"
-        else:
-            # Restore original theme if we changed it
-            if getattr(self, "_orig_theme_name", '') and self._style.theme_use() == "clam":
-                self._style.theme_use(self._orig_theme_name)
-            # Use platform defaults but ensure toggling back is readable
-            bg = "#f0f0f0"
-            fg = "#000000"
-            sel_bg = "#cce5ff"
-            sel_fg = "#000000"
-            link = "blue"
-            surface = "#ffffff"
-            header = "#eeeeee"
-            fieldbg = "#ffffff"
-            border = "#cccccc"
-            muted = "#404040"
-            accent = "#0a84ff"
+        ctk.set_appearance_mode("dark" if dark else "light")
 
         # Setting theme for macOS
         if sys.platform == "darwin":
@@ -2548,164 +2931,48 @@ class GUIManager:
                 appearance = AppKit.NSAppearance.appearanceNamed_(AppKit.NSAppearanceNameAqua)
             app.setAppearance_(appearance)
 
+        mode = 1 if dark else 0
+        bg = PALETTE["bg"][mode]
+        fg = PALETTE["fg"][mode]
+        surface = PALETTE["surface"][mode]
+        border = PALETTE["border"][mode]
+        muted = PALETTE["muted"][mode]
+        sel_bg = PALETTE["sel"][mode]
+        sel_fg = fg
+        ok = PALETTE["ok"][mode]
+        warn = PALETTE["warn"][mode]
+
+        # A handful of plain ttk.Frame/Label widgets remain (e.g. image-bearing labels,
+        # where CTkLabel would need a CTkImage instead of the cache's plain PhotoImage)
         s = self._style
-        # Fonts
-        default_font = nametofont("TkDefaultFont")
-        self._fonts["default"] = default_font
-        # Font - button style with a larger font
-        self._fonts["large"] = default_font.copy()
-        self._fonts["large"].config(size=10)
-        s.configure("Large.TButton", font=self._fonts["large"])
-        # Font - button style for sorting arrows
-        self._fonts["arrow"] = default_font.copy()
-        self._fonts["arrow"].config(size=16)
-        s.configure("Arrow.TButton", font=self._fonts["arrow"])
-        s.configure("Arrow.TButton", padding=-4)  # reduce padding on arrow buttons
-        # Font - label style that mimics links
-        self._fonts["underlined"] = default_font.copy()
-        self._fonts["underlined"].config(underline=True)
-        s.configure("Link.TLabel", font=self._fonts["underlined"], foreground=link)
-        # Font - label style with a monospace font
-        self._fonts["monospaced"] = default_font.copy()
-        self._fonts["monospaced"].config(family="Courier New", size=10)
-        s.configure("MS.TLabel", font=self._fonts["monospaced"])
+        s.configure("TFrame", background=surface)
+        s.configure("TLabel", background=surface, foreground=fg)
 
-        # Base containers and labels
-        s.configure("TFrame", background=bg, foreground=fg)
-        s.configure("TLabel", background=bg, foreground=fg)
-        s.configure("TLabelframe", background=bg, foreground=fg)
-        s.configure("TLabelframe.Label", background=bg, foreground=fg)
-        # Buttons and checks
-        s.configure("TButton", background=surface, foreground=fg, bordercolor=border)
-        s.map(
-            "TButton",
-            background=[("active", header), ("pressed", border)],
-            foreground=[("disabled", muted)],
-        )
-        s.configure(
-            "TCheckbutton",
-            background=bg,
-            foreground=fg,
-            focuscolor=bg,
-            bordercolor=border,
-        )
-        s.map(
-            "TCheckbutton",
-            # Remove hover visuals by mapping active/pressed to the base background
-            background=[
-                ("active", bg),
-                ("pressed", bg),
-            ],
-            foreground=[("disabled", muted)],
-            indicatorcolor=[
-                ("selected", accent if dark else fg),
-                ("!selected", border),
-            ],
-        )
-        # Notebook
-        s.configure("TNotebook", background=bg, bordercolor=border)
-        s.configure("TNotebook.Tab", background=surface, foreground=fg, bordercolor=border)
-        s.map(
-            "TNotebook.Tab",
-            background=[("selected", header), ("active", header)],
-            foreground=[("disabled", muted)],
-        )
-        # Entries/Combos
-        s.configure(
-            "TEntry", fieldbackground=fieldbg, background=fieldbg, foreground=fg, insertcolor=fg
-        )
-        s.configure(
-            "TCombobox", fieldbackground=fieldbg, background=fieldbg, foreground=fg, arrowcolor=fg
-        )
-        # Ensure readability for readonly comboboxes (Language, Priority mode)
-        s.map(
-            "TCombobox",
-            foreground=[("readonly", fg), ("disabled", muted)],
-            fieldbackground=[("readonly", fieldbg)],
-            background=[("readonly", fieldbg)],
-            arrowcolor=[("readonly", fg)],
-        )
-        s.map("TEntry", foreground=[("disabled", muted)])
-        # Treeview
-        s.configure(
-            "Treeview",
-            background=surface,
-            fieldbackground=surface,
-            foreground=fg,
-            bordercolor=border,
-        )
-        s.map(
-            "Treeview",
-            background=[("selected", sel_bg)],
-            foreground=[("selected", sel_fg)],
-        )
-        s.configure("Treeview.Heading", background=header, foreground=fg, bordercolor=border)
-        # Progressbar
-        s.configure("TProgressbar", background=accent, troughcolor=surface)
-        # Scrollbars
-        s.configure(
-            "Vertical.TScrollbar",
-            background=surface,
-            troughcolor=bg,
-            arrowcolor=fg,
-            bordercolor=border,
-        )
-        s.configure(
-            "Horizontal.TScrollbar",
-            background=surface,
-            troughcolor=bg,
-            arrowcolor=fg,
-            bordercolor=border,
-        )
-
-        # Pure Tk widgets
-        # Console text
-        self.output.configure_theme(bg=surface, fg=fg, sel_bg=sel_bg, sel_fg=sel_fg)
-        # Listboxes
+        # Priority/Exclude listboxes (plain tk.Listbox, no CTk equivalent)
         self.settings._priority_list.configure_theme(
             bg=surface, fg=fg, sel_bg=sel_bg, sel_fg=sel_fg
         )
         self.settings._exclude_list.configure_theme(
             bg=surface, fg=fg, sel_bg=sel_bg, sel_fg=sel_fg
         )
-        # Inventory canvas
-        self.inv.configure_theme(bg=bg)
+        # Channel list status / watching row colors (ttk Treeview tags)
+        self.channels.configure_theme(
+            watching_bg=sel_bg, online_fg=ok, pending_fg=warn, offline_fg=muted
+        )
 
-        # Tk option database for selection/popup list readability (affects Tk-backed widgets)
-        # Global selection colors and listbox defaults (covers Combobox dropdown)
-        self._root.option_add("*selectBackground", sel_bg)
-        self._root.option_add("*selectForeground", sel_fg)
-        # Combobox dropdown list (Tk Listbox)
-        for key in (
-            "*TCombobox*Listbox.background",
-            "*TCombobox*Listbox.Background",
-            "*Listbox.background",
-        ):
-            self._root.option_add(key, surface)
-        for key in (
-            "*TCombobox*Listbox.foreground",
-            "*TCombobox*Listbox.Foreground",
-            "*Listbox.foreground",
-        ):
-            self._root.option_add(key, fg)
-        for key in (
-            "*TCombobox*Listbox.selectBackground",
-            "*Listbox.selectBackground",
-        ):
-            self._root.option_add(key, sel_bg)
-        for key in (
-            "*TCombobox*Listbox.selectForeground",
-            "*Listbox.selectForeground",
-        ):
-            self._root.option_add(key, sel_fg)
-
-        # Set Windows title bar color to match dark theme
+        # Set Windows title bar color to match the theme
         if dark:
             # Use dark gray color 0x001E1E1E (ARGB format, matches bg color #1e1e1e)
             self._set_title_bar_color(0x001E1E1E)
         else:
             # Reset to system default title bar color
             self._set_title_bar_color(0xFFFFFFFF)
+
+        # the hero card icon's rounded corners are baked into the image using the
+        # current surface color (see CampaignProgress._render_icon) - force it to
+        # re-render so they match the new theme instead of staying the old color
+        self.progress._icon_rendered_size = (0, 0)
+        self.progress._render_icon()
 
 
 ###################

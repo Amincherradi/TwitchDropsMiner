@@ -310,6 +310,7 @@ default_translation: Translation = {
             "password": "Password",
             "twofa_code": "2FA code (optional)",
             "button": "Login",
+            "logout_button": "Logout",
         },
         "websocket": {
             "name": "Websocket Status",
@@ -328,14 +329,14 @@ default_translation: Translation = {
             "campaign": "Campaign:",
             "remaining": "{time} remaining",
             "drop_progress": "Progress:",
-            "campaign_progress": "Progress:",
+            "campaign_progress": "Campaign progress",
         },
         "channels": {
             "name": "Channels",
-            "switch": "Switch",
-            "online": "ONLINE  ✔",
-            "pending": "OFFLINE ⏳",
-            "offline": "OFFLINE ❌",
+            "switch": "Switch channel",
+            "online": "Online",
+            "pending": "Pending",
+            "offline": "Offline",
             "headings": {
                 "channel": "Channel",
                 "status": "Status",

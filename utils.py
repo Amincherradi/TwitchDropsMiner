@@ -43,6 +43,13 @@ def set_root_icon(root: tk.Tk, image_path: Path | str) -> None:
     root.iconphoto(True, icon_photo)  # type: ignore[arg-type]
     # keep a reference to the PhotoImage to avoid the ResourceWarning
     root._icon_image = icon_photo  # type: ignore[attr-defined]
+    if sys.platform.startswith("win"):
+        # CustomTkinter's CTk schedules an after(200, ...) callback that overwrites
+        # the titlebar icon with its own default, unless iconbitmap (not iconphoto)
+        # was already called - so call it too, to apply the real .ico directly and
+        # suppress that override.
+        with suppress(tk.TclError):
+            root.iconbitmap(default=str(image_path))
 
 
 async def first_to_complete(coros: abc.Iterable[abc.Coroutine[Any, Any, _T]]) -> _T:

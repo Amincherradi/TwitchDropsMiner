@@ -14,7 +14,7 @@ from yarl import URL
 
 from utils import Game, json_minify, isonow
 from exceptions import MinerException, RequestException
-from constants import CALL, GQL_QUERIES, ONLINE_DELAY, URLType, GQLQuery
+from constants import CALL, GQL_QUERIES, ONLINE_DELAY, URLType, GQLQuery, ClientType
 
 if TYPE_CHECKING:
     from twitch import Twitch
@@ -235,7 +235,10 @@ class Channel:
 
     @property
     def url(self) -> URLType:
-        return URLType(f"{self._twitch._client_type.CLIENT_URL}/{self._login}")
+        # Always use the public website domain here, regardless of the GQL client type
+        # in use (e.g. SMARTBOX's CLIENT_URL points at the Android TV app portal, which
+        # doesn't serve the streamer HTML page this URL is scraped from in get_spade_url).
+        return URLType(f"{ClientType.WEB.CLIENT_URL}/{self._login}")
 
     @property
     def iid(self) -> str:
@@ -308,7 +311,11 @@ class Channel:
         """
         SETTINGS_PATTERN: str = r'src="(https://[\w.]+/config/settings\.[0-9a-f]{32}\.js)"'
         SPADE_PATTERN: str = r'"spade_?url": ?"(https://[.\w\-/]+)"'
-        async with self._twitch.request("GET", self.url) as response1:
+        # These are regular website-page fetches (unlike the GQL/auth traffic, which uses
+        # whatever client type is active, e.g. SMARTBOX for login), so present as a real
+        # browser here too - the page is meant to be fetched by one.
+        web_headers = {"User-Agent": ClientType.WEB.USER_AGENT}
+        async with self._twitch.request("GET", self.url, headers=web_headers) as response1:
             streamer_html: str = await response1.text(encoding="utf8")
         match = re.search(SPADE_PATTERN, streamer_html, re.I)
         if not match:
@@ -316,7 +323,9 @@ class Channel:
             if not match:
                 raise MinerException("Error while spade_url extraction: step #1")
             streamer_settings = match.group(1)
-            async with self._twitch.request("GET", streamer_settings) as response2:
+            async with self._twitch.request(
+                "GET", streamer_settings, headers=web_headers
+            ) as response2:
                 settings_js: str = await response2.text(encoding="utf8")
             match = re.search(SPADE_PATTERN, settings_js, re.I)
             if not match:
@@ -428,7 +437,6 @@ class Channel:
         if needs_display:
             self.display()
 
-    # NOTE: This is currently unused.
     async def _send_watch_playlist(self) -> bool:
         """
         This performs a HEAD request on the stream's current playlist,
@@ -484,11 +492,21 @@ class Channel:
     async def send_watch(self) -> bool:
         if self._stream is None:
             return False
+        # Prefer a genuine stream-chunk request (real playback access token + HLS manifest
+        # HEAD request) - Twitch's drops tracking doesn't appear to reliably credit progress
+        # from the lightweight spade analytics ping alone anymore.
+        if await self._send_watch_playlist():
+            return True
+        # Fall back to the spade ping if the real request failed for some reason
+        # (e.g. transient CDN hiccup) - better than not reporting anything at all.
         if self._spade_url is None:
             self._spade_url = await self.get_spade_url()
         try:
             async with self._twitch.request(
-                "POST", self._spade_url, data=self._stream.spade_payload
+                "POST",
+                self._spade_url,
+                data=self._stream.spade_payload,
+                headers={"User-Agent": ClientType.WEB.USER_AGENT},
             ) as response:
                 return response.status == 204
         except RequestException:

@@ -92,7 +92,7 @@ class ImageCache:
         bits = ''.join('1' if px >= avg_pixel else '0' for px in pixel_data)
         return ImageHash(f"{int(bits, 2):x}.png")
 
-    async def get(self, url: URLType, size: ImageSize | None = None) -> PhotoImage:
+    async def _get_image(self, url: URLType) -> tuple[ImageHash, Image]:
         async with self._lock:
             image: Image | None = None
             if url in self._hashes:
@@ -127,6 +127,10 @@ class ImageCache:
         # NOTE: If self._hashes ever stops being updated in both above if cases,
         # this will need to be moved
         self._altered = True
+        return img_hash, image
+
+    async def get(self, url: URLType, size: ImageSize | None = None) -> PhotoImage:
+        img_hash, image = await self._get_image(url)
         if size is None:
             size = image.size
         photo_key = (img_hash, size)
@@ -140,3 +144,12 @@ class ImageCache:
                 image = Image_module.new("RGB", size, (255, 255, 255))
         self._photos[photo_key] = photo = PhotoImage(master=self._root, image=image)
         return photo
+
+    async def get_image(self, url: URLType) -> Image:
+        """
+        Like get(), but returns the raw, original-resolution PIL Image instead of a
+        pre-rendered, fixed-size PhotoImage - for callers that want to wrap it in a
+        CTkImage themselves (which handles resizing and HighDPI scaling on its own).
+        """
+        _, image = await self._get_image(url)
+        return image

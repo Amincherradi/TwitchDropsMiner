@@ -99,7 +99,7 @@ class _AuthState:
     def invalidate(self, *, delete_cookies: bool = False) -> None:
         self._delattrs("access_token", "user_id")
         self._logged_in.clear()
-        self._twitch.gui.help._invalidate_button.config(state="disabled")
+        self._twitch.gui.help._invalidate_button.configure(state="disabled")
         if delete_cookies:
             session = self._twitch._session
             if session is not None:
@@ -116,7 +116,7 @@ class _AuthState:
             "client_version",
         )
         self._logged_in.clear()
-        self._twitch.gui.help._invalidate_button.config(state="disabled")
+        self._twitch.gui.help._invalidate_button.configure(state="disabled")
 
     async def _oauth_login(self) -> str:
         login_form: LoginForm = self._twitch.gui.login
@@ -426,7 +426,7 @@ class _AuthState:
             # update our cookie and save it
             jar.update_cookies(cookie, client_info.CLIENT_URL)
             jar.save(COOKIES_PATH)
-        self._twitch.gui.help._invalidate_button.config(state="normal")
+        self._twitch.gui.help._invalidate_button.configure(state="normal")
         self._logged_in.set()
 
 
@@ -445,7 +445,7 @@ class Twitch:
         # Do not modify the default, safe values.
         self._qgl_limiter = RateLimiter(capacity=5, window=1)
         # Client type, session and auth
-        self._client_type: ClientInfo = ClientType.ANDROID_APP
+        self._client_type: ClientInfo = ClientType.SMARTBOX
         self._session: aiohttp.ClientSession | None = None
         self._auth_state: _AuthState = _AuthState(self)
         # GUI
@@ -907,54 +907,25 @@ class Twitch:
                 logger.log(CALL, f"Watch requested failed for channel: {channel.name}")
             # wait ~20 seconds for a progress update
             await asyncio.sleep(20)
-            if self.gui.progress.minute_almost_done():
-                # If the previous update was more than ~60s ago, and the progress tracker
-                # isn't counting down anymore, that means Twitch has temporarily
-                # stopped reporting drop's progress. To ensure the timer keeps at least somewhat
-                # accurate time, we can use GQL to query for the current drop,
-                # or even "pretend" mining as a last resort option.
-                handled: bool = False
-
-                # Solution 1: use GQL to query for the currently mined drop status
-                try:
-                    context = await self.gql_request(
-                        GQL_QUERIES["CurrentDrop"].with_variables(
-                            {"channelID": str(channel.id)}
-                        )
+            # Drop progress isn't always pushed by the websocket (process_drops handles it
+            # when it is, and calls update_minutes() directly), and GQL's CurrentDrop query
+            # has proven unreliable - it can keep returning the exact same stale snapshot
+            # indefinitely without ever erroring, which used to make this loop treat it as
+            # "success" and skip the local bump_minutes() fallback below forever, freezing
+            # progress completely. So: always advance the local estimate optimistically here;
+            # real data from the websocket (or MAX_EXTRA_MINUTES's safety cap) corrects it.
+            if (active_campaign := self.get_active_campaign(channel)) is not None:
+                active_campaign.bump_minutes(channel)
+                drop_text = f"Unknown drop ({active_campaign.game})"
+                if (active_drop := active_campaign.first_drop) is not None:
+                    active_drop.display()
+                    drop_text = (
+                        f"{active_drop.name} ({active_drop.campaign.game}, "
+                        f"{active_drop.current_minutes}/{active_drop.required_minutes})"
                     )
-                    drop_data: JsonType | None = (
-                        context["data"]["currentUser"]["dropCurrentSession"]
-                    )
-                except GQLException:
-                    drop_data = None
-                if drop_data is not None:
-                    gql_drop: TimedDrop | None = self._drops.get(drop_data["dropID"])
-                    if gql_drop is not None and gql_drop.can_earn(channel):
-                        gql_drop.update_minutes(drop_data["currentMinutesWatched"])
-                        drop_text: str = (
-                            f"{gql_drop.name} ({gql_drop.campaign.game}, "
-                            f"{gql_drop.current_minutes}/{gql_drop.required_minutes})"
-                        )
-                        logger.log(CALL, f"Drop progress from GQL: {drop_text}")
-                        handled = True
-
-                # Solution 2: If GQL fails, figure out which campaign we're most likely mining
-                # right now, and then bump up the minutes on it's drops
-                if not handled:
-                    if (active_campaign := self.get_active_campaign(channel)) is not None:
-                        active_campaign.bump_minutes(channel)
-                        # NOTE: This usually gets overwritten below
-                        drop_text = f"Unknown drop ({active_campaign.game})"
-                        if (active_drop := active_campaign.first_drop) is not None:
-                            active_drop.display()
-                            drop_text = (
-                                f"{active_drop.name} ({active_drop.campaign.game}, "
-                                f"{active_drop.current_minutes}/{active_drop.required_minutes})"
-                            )
-                        logger.log(CALL, f"Drop progress from active search: {drop_text}")
-                        handled = True
-                    else:
-                        logger.log(CALL, "No active drop could be determined")
+                logger.log(CALL, f"Drop progress from active search: {drop_text}")
+            else:
+                logger.log(CALL, "No active drop could be determined")
             await self._watch_sleep(interval - min(time() - last_sent, interval))
 
     @task_wrapper(critical=True)
