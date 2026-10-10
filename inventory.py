@@ -13,7 +13,7 @@ from translate import _
 from channel import Channel
 from utils import timestamp, Game
 from exceptions import GQLException
-from constants import GQL_QUERIES, MAX_EXTRA_MINUTES, URLType, State
+from constants import GQL_QUERIES, URLType
 
 if TYPE_CHECKING:
     from collections import abc
@@ -224,7 +224,6 @@ class TimedDrop(BaseDrop):
             "self" in data and data["self"]["currentMinutesWatched"] or 0
         )
         self.required_minutes: int = data["requiredMinutesWatched"]
-        self.extra_current_minutes: int = 0
         if self.is_claimed:
             # claimed drops may report inconsistent current minutes, so we need to overwrite them
             self.real_current_minutes = self.required_minutes
@@ -244,7 +243,10 @@ class TimedDrop(BaseDrop):
 
     @property
     def current_minutes(self) -> int:
-        return self.real_current_minutes + self.extra_current_minutes
+        # only ever Twitch-confirmed minutes (via GQL or the websocket's drop-progress
+        # push) - no local "pretend" progress, so this always matches what Twitch's own
+        # drops inventory page shows, instead of occasionally running ahead of it.
+        return self.real_current_minutes
 
     @property
     def remaining_minutes(self) -> int:
@@ -289,9 +291,6 @@ class TimedDrop(BaseDrop):
         return (
             super()._base_earn_conditions()
             and self.required_minutes > 0
-            # NOTE: This may be a bad idea, as it invalidates the can_earn status
-            # and provides no way to recover from this state until the next reload.
-            and self.extra_current_minutes < MAX_EXTRA_MINUTES
         )
 
     def _on_state_changed(self) -> None:
@@ -304,22 +303,12 @@ class TimedDrop(BaseDrop):
             self.real_current_minutes += delta
         else:
             self.real_current_minutes = self.required_minutes
-        self.extra_current_minutes = 0
         self._on_state_changed()
-
-    def _bump_minutes(self, channel: Channel | None) -> bool:
-        if self.can_earn(channel):
-            self.extra_current_minutes += 1
-            self._on_state_changed()
-            if self.extra_current_minutes >= MAX_EXTRA_MINUTES:
-                return True
-        return False
 
     async def claim(self) -> bool:
         result = await super().claim()
         if result:
             self.real_current_minutes = self.required_minutes
-            self.extra_current_minutes = 0
         self._on_state_changed()
         return result
 
@@ -498,15 +487,3 @@ class DropsCampaign:
             and any(drop._can_earn_within(stamp) for drop in self.drops)
         )
 
-    def bump_minutes(self, channel: Channel) -> None:
-        # NOTE: Use a temporary list to ensure all drops are bumped before checking
-        if any([drop._bump_minutes(channel) for drop in self.drops]):
-            # Executes if any drop's extra_current_minutes reach MAX_ESTIMATED_MINUTES
-            # TODO: Figure out a better way to handle this case
-            logger.warning(
-                f"At least one of the drops in campaign \"{self.name}({self.game.name})\" "
-                "has reached the maximum extra minutes limit!"
-            )
-            self._twitch.change_state(State.CHANNEL_SWITCH)
-        if (first_drop := self.first_drop) is not None:
-            first_drop.display()

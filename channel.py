@@ -161,7 +161,7 @@ class Stream:
 class Channel:
     __slots__ = (
         "_twitch", "_gui_channels", "id", "_login", "_display_name", "_spade_url",
-        "_stream", "_pending_stream_up", "acl_based"
+        "profile_image_url", "_stream", "_pending_stream_up", "acl_based"
     )
 
     def __init__(
@@ -179,6 +179,7 @@ class Channel:
         self._login: str = login
         self._display_name: str | None = display_name
         self._spade_url: URLType | None = None
+        self.profile_image_url: URLType | None = None
         self._stream: Stream | None = None
         self._pending_stream_up: asyncio.Task[Any] | None = None
         # ACL-based channels are:
@@ -189,13 +190,18 @@ class Channel:
 
     @classmethod
     def from_acl(cls, twitch: Twitch, data: JsonType) -> Channel:
-        return cls(
+        self = cls(
             twitch,
             id=data["id"],
             login=data["name"],
             display_name=data.get("displayName"),
             acl_based=True,
         )
+        # opportunistic - grabbed if this particular query happens to return it,
+        # without requiring an extra request just for this
+        if data.get("profileImageURL"):
+            self.profile_image_url = URLType(data["profileImageURL"])
+        return self
 
     @classmethod
     def from_directory(
@@ -205,6 +211,8 @@ class Channel:
         self = cls(
             twitch, id=channel["id"], login=channel["login"], display_name=channel["displayName"]
         )
+        if channel.get("profileImageURL"):
+            self.profile_image_url = URLType(channel["profileImageURL"])
         self._stream = Stream.from_directory(self, data, drops_enabled=drops_enabled)
         return self
 
@@ -366,6 +374,8 @@ class Channel:
         # fill in display name
         if self._display_name is None:
             self._display_name = channel_data["displayName"]
+        if channel_data.get("profileImageURL"):
+            self.profile_image_url = URLType(channel_data["profileImageURL"])
         if not channel_data["stream"]:
             return None
         stream = Stream.from_get_stream(self, channel_data)

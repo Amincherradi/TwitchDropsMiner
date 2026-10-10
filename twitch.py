@@ -907,25 +907,28 @@ class Twitch:
                 logger.log(CALL, f"Watch requested failed for channel: {channel.name}")
             # wait ~20 seconds for a progress update
             await asyncio.sleep(20)
-            # Drop progress isn't always pushed by the websocket (process_drops handles it
-            # when it is, and calls update_minutes() directly), and GQL's CurrentDrop query
-            # has proven unreliable - it can keep returning the exact same stale snapshot
-            # indefinitely without ever erroring, which used to make this loop treat it as
-            # "success" and skip the local bump_minutes() fallback below forever, freezing
-            # progress completely. So: always advance the local estimate optimistically here;
-            # real data from the websocket (or MAX_EXTRA_MINUTES's safety cap) corrects it.
-            if (active_campaign := self.get_active_campaign(channel)) is not None:
-                active_campaign.bump_minutes(channel)
-                drop_text = f"Unknown drop ({active_campaign.game})"
-                if (active_drop := active_campaign.first_drop) is not None:
-                    active_drop.display()
+            # Query GQL for the real, Twitch-confirmed progress. We intentionally don't
+            # locally "pretend" progress here anymore (no optimistic bumping) - the
+            # displayed minutes should only ever be what Twitch has actually confirmed,
+            # so they always match twitch.tv/drops/inventory exactly, even if that means
+            # the display sometimes lags behind reality while Twitch is slow to confirm.
+            try:
+                context = await self.gql_request(
+                    GQL_QUERIES["CurrentDrop"].with_variables({"channelID": str(channel.id)})
+                )
+                drop_data: JsonType | None = context["data"]["currentUser"]["dropCurrentSession"]
+            except GQLException:
+                drop_data = None
+            if drop_data is not None:
+                gql_drop: TimedDrop | None = self._drops.get(drop_data["dropID"])
+                if gql_drop is not None and gql_drop.can_earn(channel):
+                    gql_drop.update_minutes(drop_data["currentMinutesWatched"])
+                    gql_drop.display()
                     drop_text = (
-                        f"{active_drop.name} ({active_drop.campaign.game}, "
-                        f"{active_drop.current_minutes}/{active_drop.required_minutes})"
+                        f"{gql_drop.name} ({gql_drop.campaign.game}, "
+                        f"{gql_drop.current_minutes}/{gql_drop.required_minutes})"
                     )
-                logger.log(CALL, f"Drop progress from active search: {drop_text}")
-            else:
-                logger.log(CALL, "No active drop could be determined")
+                    logger.log(CALL, f"Drop progress from GQL: {drop_text}")
             await self._watch_sleep(interval - min(time() - last_sent, interval))
 
     @task_wrapper(critical=True)

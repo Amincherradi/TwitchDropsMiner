@@ -14,6 +14,7 @@ from collections import abc
 from textwrap import dedent
 from dataclasses import dataclass
 from tkinter.font import Font
+from contextlib import suppress
 from functools import partial, cached_property
 from datetime import datetime, timedelta, timezone
 from tkinter import ttk, StringVar, DoubleVar, IntVar
@@ -974,7 +975,10 @@ class CampaignProgress:
         rounded = Image_module.new("RGB", (width, height), bg_color)
         rounded.paste(cropped.convert("RGB"), mask=mask)
         icon = ctk.CTkImage(light_image=rounded, size=(width, height))
-        self._icon_label.configure(image=icon, text="")
+        # can fire (via the <Configure> binding) after the window has started tearing
+        # down on exit, by which point the widget's underlying Tcl image is already gone
+        with suppress(tk.TclError):
+            self._icon_label.configure(image=icon, text="")
 
     def _on_icon_configure(self, event: tk.Event) -> None:
         self._render_icon()
@@ -985,7 +989,10 @@ class CampaignProgress:
         if self._icon_task is not None:
             self._icon_task.cancel()
             self._icon_task = None
-        self._icon_label.configure(image=None, text="⛏")
+        # can run during shutdown (clear_drop -> display(None)), after the previous
+        # CTkImage's underlying Tcl image has already been torn down
+        with suppress(tk.TclError):
+            self._icon_label.configure(image=None, text="⛏")
 
     def _divmod(self, minutes: int) -> tuple[int, int]:
         if self._seconds < 60 and minutes > 0:
@@ -1108,6 +1115,8 @@ class ConsoleOutput:
 
 class _ChannelRow(TypedDict):
     frame: ctk.CTkFrame
+    avatar: ctk.CTkLabel
+    avatar_url: URLType | None
     name_label: ctk.CTkLabel
     badge: ctk.CTkFrame
     game_label: ctk.CTkLabel
@@ -1133,7 +1142,7 @@ class ChannelList:
     # (minsize px, stretch weight) per column - shared by the header row and every
     # data row, so they both grow in lockstep and the table fills the card's width
     # instead of leaving a dead gap after the last column.
-    _COLUMNS = ((34, 0), (170, 3), (150, 2), (90, 1), (110, 1))
+    _COLUMNS = ((34, 0), (170, 3), (150, 2), (90, 1), (110, 1), (40, 0))
 
     def __init__(self, manager: GUIManager, master: tk.Misc):
         self._manager = manager
@@ -1312,8 +1321,25 @@ class ChannelList:
         status_label = ctk.CTkLabel(status_box, text='', anchor="w")
         status_label.grid(column=1, row=0, sticky="w")
 
+        # dedicated column: a Twitch-glyph button that opens the channel in the browser
+        open_button = ctk.CTkButton(
+            frame,
+            text="↗",  # external-link arrow
+            width=28,
+            height=28,
+            corner_radius=8,
+            fg_color="transparent",
+            hover_color=PALETTE["border"],
+            text_color=PALETTE["accent"],
+            font=ctk.CTkFont(size=14, weight="bold"),
+            command=partial(self._open_channel, iid),
+        )
+        open_button.grid(column=5, row=0)
+
         row = _ChannelRow(
             frame=frame,
+            avatar=avatar,
+            avatar_url=None,
             name_label=name_label,
             badge=badge,
             game_label=game_label,
@@ -1327,6 +1353,11 @@ class ChannelList:
         ):
             widget.bind("<Button-1>", partial(self._select_row, iid))
         return row
+
+    def _open_channel(self, iid: str, _event: tk.Event[Any] | None = None) -> None:
+        channel = self._channel_map.get(iid)
+        if channel is not None:
+            webopen(channel.url)
 
     def display(self, channel: Channel, *, add: bool = False) -> None:
         iid = channel.iid
@@ -1359,6 +1390,23 @@ class ChannelList:
         row["status_label"].configure(text=status, text_color=color)
         row["status_dot"].configure(fg_color=color)
         self._restyle_row(iid)
+        avatar_url = channel.profile_image_url
+        if avatar_url is not None and avatar_url != row["avatar_url"]:
+            row["avatar_url"] = avatar_url
+            asyncio.create_task(self._load_avatar(row["avatar"], avatar_url))
+
+    async def _load_avatar(self, avatar: ctk.CTkLabel, url: URLType) -> None:
+        size = 18
+        source = await self._manager._cache.get_image(url)
+        source = source.convert("RGB").resize((size, size), Image_module.Resampling.LANCZOS)
+        # mask to a circle, to match the generic placeholder dot's shape
+        mask = Image_module.new("L", (size, size), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
+        circular = Image_module.new("RGBA", (size, size))
+        circular.paste(source, mask=mask)
+        photo = PhotoImage(master=self._manager._root, image=circular)
+        with suppress(tk.TclError):
+            avatar.configure(image=photo)
 
     def remove(self, channel: Channel) -> None:
         iid = channel.iid
